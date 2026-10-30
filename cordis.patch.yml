@@ -1,0 +1,7 @@
+# Insert the roundtable host row into the Harness plugin tree.
+# `name` must be the npm package name so Node resolves the installed code.
+- insert:
+    - id: issue-roundtable
+      name: 'dsh-issue-roundtable'
+      config:
+        root: !!js dshHomePath('issue-roundtable')

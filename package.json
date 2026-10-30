@@ -1,0 +1,37 @@
+{
+  "name": "dsh-issue-roundtable",
+  "version": "0.1.0",
+  "description": "议题圆桌：为议题定义多个不同角色的发言者，让它们多轮交锋，最后由全体投票表决出一个方案。An issue roundtable workbench for DSH Desktop.",
+  "type": "module",
+  "main": "dsh/index.js",
+  "exports": {
+    ".": "./dsh/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dsh/",
+    "lib/",
+    "locale/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "MIT",
+  "author": "11018790",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "dsh-desktop-workbenches"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  }
+}

@@ -32,6 +32,14 @@ DSH Desktop 的工作台插件：以**图形化的圆桌会议**组织多角色 
 - 新建/编辑角色：名称、关注点、分组、立场与说话方式（至少 20 字）。
 - **AI 帮我写角色**：一句描述 → 2~3 个差异明显的候选（名称/关注点/立场），点候选直接填入表单再微调。
 
+### 团队化管理（Agent 建组 / 批量改写）
+
+角色库支持**按组与按角色多选**，并由 Agent 批量处理：
+
+- **AI 建团队**：描述一个决策场景（例如「我想建一个个股投研组，判断某只股票值不值得买」）→ Agent 一次给出**分组 + 4~6 个互补角色**。可选「写满人设」或「只出框架（人设待补）」。预览里能改分组名、逐个改名称/关注点/人设、移除角色，确认后**整组一次落库**。
+- **选中范围改写**：勾选整个分组（左侧分组前的复选框）或勾选若干角色 → 输入一句话要求（例如「整体更保守，都要先问下行风险」）→ Agent 逐个改写并给出**前后对照**，你可以逐个勾选接受，只把勾选的写入库里，未勾选的保持原样。
+- **模型工具**：宿主注册了 `roundtable_library`（读/整体写回分组与角色）和 `roundtable_team`（生成一个分组与其全部角色），所以对话里的 Agent 也能直接管理角色库，不必你手动点。
+
 ## 讨论与表决流程
 
 ```
@@ -98,14 +106,14 @@ test/live.mjs           对运行中的 Host 跑真实模型讨论
 
 ```bash
 node scripts/build-client.mjs   # 先构建客户端产物
-node test/smoke.mjs             # 47 项：分组/角色、议题 CRUD、轮次、追加、表决、平票、AI 助手、校验
-node test/panel.mjs             # 48 项：圆桌、列表筛选、长文本折叠/抽屉/密度/筛选、向导、角色库
+node test/smoke.mjs             # 66 项：分组/角色、议题 CRUD、轮次、追加、表决、平票、AI 助手、团队与范围改写、校验
+node test/panel.mjs             # 64 项：圆桌、列表筛选、长文本折叠/抽屉/密度/筛选、向导、角色库、团队向导、多选改写
 node test/installed.mjs <已安装的包目录>
 node test/register.mjs
 node test/live.mjs <token-url>  # 会真实调用模型
 ```
 
-前四个不联网、不读真实模型。`test/panel.mjs`、`test/register.mjs` 从 DSH 安装目录借用 `jsdom`、`react`、`react-dom` 与真实的 `dsh-desktop-workbenches/client.js`（路径写在脚本顶部）；`test/live.mjs` 通过认证 cookie 调运行中的 Host。
+`node_modules/` 只用来把宿主的 `@deepseek-ai/*` 包链接进来，不进版本库。前四个不联网、不读真实模型。`test/panel.mjs`、`test/register.mjs` 从 DSH 安装目录借用 `jsdom`、`react`、`react-dom` 与真实的 `dsh-desktop-workbenches/client.js`（路径写在脚本顶部）；`test/live.mjs` 通过认证 cookie 调运行中的 Host。
 
 ## 已知限制
 
@@ -114,3 +122,4 @@ node test/live.mjs <token-url>  # 会真实调用模型
 - 议题记录保存在本机，不做云同步，超过上限会裁掉最旧的。
 - 讨论引擎依赖宿主进程：卸载插件或重启 Harness 时进行中的讨论会被取消并记为「已取消」。
 - `src/client/roundtable.js`、`views.js`、`detail.js`、`wizard.js`、`library.js` 是同一份 UI 的模块化参考实现；Desktop 只加载构建产物 `lib/client.js`（由 `index.js` + `styles.css` 组装），两者若改动需要同步。
+

@@ -41,8 +41,12 @@ const CLERK = JSON.stringify({
 
 function scripted(options) {
   const system = options.system ?? ''
-  const lastUser = [...(options.messages ?? [])].reverse().find((message) => message.role === 'user')
+  // `callModel` always hands the model `messages`; a one-shot prompt arrives
+  // as its single user message, so read the last user text either way.
+  const allUser = (options.messages ?? []).filter((message) => message.role === 'user')
+  const lastUser = allUser.at(-1)
   const lastText = lastUser?.content?.[0]?.text ?? ''
+  const userPrompt = allUser.map((message) => message.content?.[0]?.text ?? '').join('\n')
   if (system.includes('议题顾问')) {
     const userTurns = (options.messages ?? []).filter((message) => message.role === 'user').length
     if (userTurns <= 1) {
@@ -79,6 +83,26 @@ function scripted(options) {
           tags: ['稳定性'],
         },
       ],
+    })
+  }
+  if (system.includes('团队设计器')) {
+    return JSON.stringify({
+      group: { name: '个股投研', description: '判断某只股票值不值得买' },
+      reply: '覆盖宏观、行业、公司基本面、估值、风险五个互补视角。',
+      roles: [
+        { name: '宏观策略师', focus: '周期与流动性', persona: '你从上层的周期与流动性看个股：先判断现在是不是买股票的时点，再用宏观假设压过公司故事；你习惯先给一个基准情景，再给出乐观与悲观两个区间，并用流动性数据说明为什么现在能买或不能买。', tags: ['宏观'] },
+        { name: '行业分析师', focus: '景气与格局', persona: '你盯住行业景气度、供需与竞争格局：会追问这家公司的增长到底来自行业红利还是自身份额提升，并核对产能、价格与库存三个指标；你不接受只讲赛道不讲份额的叙事。', tags: ['行业'] },
+        { name: '基本面分析师', focus: '财报质量', persona: '你只看财报与经营数据：收入质量、经营性现金流、资本开支回报与负债结构，会用三个关键比率反驳任何没有数字支撑的故事，并标出你用的口径与假设。', tags: ['基本面'] },
+        { name: '量化交易员', focus: '赔率与仓位', persona: '你关心赔率、波动与仓位：认为再好的公司买贵了也是坏交易，习惯用概率与回撤分布说话，并要求每个建议都给出进场区间、止损位和预期持有周期。', tags: ['量化'] },
+        { name: '风控负责人', focus: '下行与集中度', persona: '你先问最坏情况：如果逻辑证伪会跌多少、组合能不能扛住、集中度是否过高；任何方案都要先过下行测试与压力情景，否则你不签字，并会要求给出明确的退出条件。', tags: ['风控'] },
+      ],
+    })
+  }
+  if (system.includes('团队编辑器')) {
+    const targets = [...userPrompt.matchAll(/--- id: ([^\n]+)/g)].map((match) => match[1].trim())
+    return JSON.stringify({
+      reply: '统一提高了保守程度，各自视角保持不变。',
+      roles: targets.map((id) => ({ id, name: '保持不变', focus: '不变', persona: '你改写后更保守：任何乐观假设都要先给出下行情形与止损条件，并用数字说明能承受多大回撤。', changed: '加入下行情形与止损条件' })),
     })
   }
   if (system.includes('书记员')) return CLERK
@@ -255,6 +279,57 @@ async function main() {
 
   check('空描述会被拒绝', (await call(routes, '/assist/role', { method: 'POST', body: { input: '' } })).status === 400, null)
 
+  // ---- team assist: a whole group of roles in one call ----
+  const team = await call(routes, '/assist/team', { method: 'POST', body: { input: '我想建一个个股投研组，判断某只股票值不值得买', mode: 'full' } })
+  check('团队助手给出分组名', team.status === 200 && team.data.group?.name === '个股投研', team.data.group)
+  check('团队助手返回 4~6 个互补角色', team.data.roles.length >= 4 && team.data.roles.length <= 6, team.data.roles?.length)
+  check('团队角色都带人设（full 模式）', team.data.roles.every((role) => role.name && role.focus && role.persona.length >= 60), team.data.roles?.map((r) => (r.persona ?? '').length))
+  check('团队角色视角不重复', new Set(team.data.roles.map((role) => role.name)).size === team.data.roles.length, null)
+  check('团队助手给出说明', team.data.reply.length > 5, team.data.reply)
+
+  const skeleton = await call(routes, '/assist/team', { method: 'POST', body: { input: '我想建一个个股投研组', mode: 'skeleton' } })
+  check('只出框架模式也能给角色', skeleton.status === 200 && skeleton.data.mode === 'skeleton' && skeleton.data.roles.length >= 4, skeleton.data.mode)
+  check('空场景被拒绝', (await call(routes, '/assist/team', { method: 'POST', body: { input: '' } })).status === 400, null)
+
+  // 落库：把整组角色写进角色库（模拟面板确认）
+  const beforeGroups = (await call(routes, '/state')).data
+  const newGroup = { name: team.data.group.name, description: team.data.group.description }
+  const teamRoles = team.data.roles.map((role) => ({ name: role.name, focus: role.focus, persona: role.persona, groupId: 'invest' }))
+  const applied = await call(routes, '/library/apply', {
+    method: 'POST',
+    body: { groups: [...beforeGroups.groups, { id: 'invest', ...newGroup }], roles: [...beforeGroups.roles, ...teamRoles] },
+  })
+  check('整组角色一次落库', applied.status === 200 && applied.data.groups.length === beforeGroups.groups.length + 1, applied.data.groups?.length)
+  check('落库后角色数增加了整组', applied.data.roles.length === beforeGroups.roles.length + teamRoles.length, applied.data.roles?.length)
+  const libraryAfter = await call(routes, '/state')
+  check('新组角色归属正确', libraryAfter.data.roles.filter((role) => role.groupId === 'invest').length === teamRoles.length, null)
+
+  // ---- scoped revise: pick several roles, one instruction, preview then commit ----
+  const investIds = libraryAfter.data.roles.filter((role) => role.groupId === 'invest').map((role) => role.id)
+  const revise = await call(routes, '/assist/revise', {
+    method: 'POST',
+    body: { roleIds: investIds, groupIds: ['invest'], instruction: '这组人整体更保守一些，都要先问下行情形' },
+  })
+  check('范围改写返回每个选中角色', revise.status === 200 && revise.data.revised.length === investIds.length, revise.data.revised?.length)
+  check('改写结果保留原 id', revise.data.revised.every((item) => investIds.includes(item.id)), revise.data.revised.map((r) => r.id))
+  check('改写结果带前后对照', revise.data.revised.every((item) => item.before?.persona && item.persona !== item.before.persona), null)
+  check('改写结果说明改了什么', revise.data.revised.every((item) => item.changed.length > 0), null)
+  check('改写说明可见', revise.data.reply.length > 5, revise.data.reply)
+
+  const noTargets = await call(routes, '/assist/revise', { method: 'POST', body: { roleIds: [], instruction: '改一下' } })
+  check('没选角色时拒绝改写', noTargets.status === 409, noTargets.status)
+  check('空指令被拒绝', (await call(routes, '/assist/revise', { method: 'POST', body: { roleIds: investIds, instruction: ' ' } })).status === 400, null)
+
+  // 只落库被确认的那一个角色，其余保持不变
+  const rolesBeforeCommit = libraryAfter.data.roles
+  const confirmed = revise.data.revised[0]
+  const commitRoles = rolesBeforeCommit.map((role) =>
+    role.id === confirmed.id ? { ...role, name: confirmed.name === '保持不变' ? role.name : confirmed.name, focus: confirmed.focus === '不变' ? role.focus : confirmed.focus, persona: confirmed.persona } : role,
+  )
+  const committed = await call(routes, '/library/apply', { method: 'POST', body: { groups: libraryAfter.data.groups, roles: commitRoles } })
+  check('改写结果可选择性落库', committed.status === 200 && committed.data.roles.find((role) => role.id === confirmed.id).persona === confirmed.persona, null)
+  check('未确认的角色保持原样', committed.data.roles.filter((role) => role.groupId === 'invest' && role.id !== confirmed.id).every((role) => rolesBeforeCommit.find((old) => old.id === role.id).persona === role.persona), null)
+
   // ---- validation, list ordering, delete ----
   const badIssue = await call(routes, '/issue/create', { method: 'POST', body: { title: '短', roleIds: ['product', 'engineering'] } })
   check('过短标题被拒绝', badIssue.status === 400 && badIssue.data.error.includes('太短'), badIssue.data)
@@ -276,7 +351,7 @@ async function main() {
   const renamed = await call(routes, '/issue/update', { method: 'POST', body: { id: issueId, title: '改个标题' } })
   check('可修改空闲议题的标题', renamed.status === 200 && renamed.data.issue.title === '改个标题', renamed.data.issue?.title)
 
-  await rm(root, { recursive: true, force: true })
+  // The engine persists issues after the response settles; give the last\n  // write a moment so the temp directory is not removed mid-write.\n  await new Promise((resolve) => setTimeout(resolve, 300))\n  await rm(root, { recursive: true, force: true }).catch(() => {})
 
   for (const item of checks) console.log(`${item.ok ? 'PASS' : 'FAIL'}  ${item.name}${item.ok ? '' : `  → ${JSON.stringify(item.detail)}`}`)
   console.log(`\n${checks.filter((item) => item.ok).length}/${checks.length} 项通过`)
@@ -287,3 +362,7 @@ main().catch((error) => {
   console.error(error)
   process.exitCode = 1
 })
+
+
+
+

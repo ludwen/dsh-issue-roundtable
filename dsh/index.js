@@ -394,6 +394,30 @@ const ROLE_ASSIST_SYSTEM = [
   '给出 2 到 3 个差异明显的候选：视角不同、而不是同一个人的不同措辞。persona 用第二人称「你」来写，并且要能直接驱动发言。',
 ].join('\n')
 
+const TEAM_ASSIST_SYSTEM = [
+  '你是圆桌会议的角色团队设计器：用户描述一个决策场景，你要给出一个可用的角色分组和该组的全部角色。',
+  '你只输出一个 JSON 对象，不要输出任何其它文字或代码块标记：',
+  '{"group":{"name":"分组名（2~8字）","description":"这个组负责哪类决策（不超过40字）"},',
+  '"reply":"给对方看的说明（1~3句：为什么是这几个视角、覆盖了什么、还缺什么）",',
+  '"roles":[{"name":"角色名（2~8字）","focus":"关注点（不超过12字）","persona":"立场与说话方式，120~200字，第二人称「你」，写清站在谁那边、最在意什么、怎么反驳别人","tags":["标签"]}]}',
+  '规则：',
+  '1. 角色 4~6 个，视角必须真正互补（例如投研场景：宏观、行业、公司基本面、估值/量化、风控），不要同一视角换措辞。',
+  '2. 每个 persona 都要能直接驱动发言，避免「你需要关注XXX」这种空话，要写清它怎么说话、会怎么反驳。',
+  '3. 用户指定的必须遵守；用户没说的，按这个场景的常规决策结构补齐，并在 reply 里说明你补了什么。',
+].join('\n')
+
+const TEAM_REVISE_SYSTEM = [
+  '你是圆桌会议的角色团队编辑器：用户选中了若干角色并给了一句修改要求，你要逐个给出改写后的人设。',
+  '你只输出一个 JSON 对象，不要输出任何其它文字或代码块标记：',
+  '{"reply":"给对方看的说明（1~2句：你改了什么、为什么）",',
+  '"roles":[{"id":"原角色 id（原样返回）","name":"角色名","focus":"关注点","persona":"改写后的完整人设","changed":"一句话说明这一处怎么改了"}]}',
+  '规则：',
+  '1. 每个输入角色都必须返回一条，id 原样保留，不要新增或删除角色。',
+  '2. 尊重每个角色原有的视角分工：只在用户要求的维度上改写，不要把所有角色改成一个风格。',
+  '3. persona 给完整全文（不是增量），保持 120~200 字、第二人称「你」。',
+  '4. 如果用户的要求和角色定位冲突，在 reply 里指出，并按最接近用户意图的方式改写。',
+].join('\n')
+
 // ------------------------------------------------------------------- engine
 
 function tallyOf(proposals, votes) {
@@ -1007,6 +1031,285 @@ export function apply(ctx, config) {
     if (!suggestions.length) throw new HttpError(`没能生成可用角色，模型返回：${clampText(result.text, 300)}`, 502)
     return respond({ suggestions })
   })
+
+  // ---- team assist: design a whole group of roles, or rewrite a chosen scope ----
+
+  route('/assist/team', ['POST'], async (request) => {
+    await loadState()
+    const body = await readBody(request)
+    const input = clampText(typeof body?.input === 'string' ? body.input.trim() : '', 1200).trim()
+    if (input.length < 2) throw new HttpError('请描述这个团队要覆盖什么决策场景。')
+    const skeleton = body?.mode === 'skeleton'
+    const existingGroups = state.groups.map((group) => group.name).join('、')
+    const existingRoles = state.roles.map((role) => role.name).join('、')
+    const result = await callModel(ctx, {
+      system: TEAM_ASSIST_SYSTEM,
+      user: [
+        `【用户想要的团队】\n${input}`,
+        existingGroups ? `【已有分组（避免重名）】\n${existingGroups}` : '',
+        existingRoles ? `【已有角色（避免重复视角）】\n${existingRoles}` : '',
+        skeleton
+          ? '【输出模式】只出框架：persona 允许留空字符串，但 name 与 focus 必须给全，reply 里说明每个角色打算怎么发言。'
+          : '【输出模式】完整人设：每个角色的 persona 必须写满 120~200 字。',
+      ]
+        .filter(Boolean)
+        .join('\n\n'),
+      maxTokens: skeleton ? 700 : 2000,
+      temperature: 0.6,
+    })
+    const parsed = extractJson(result.text)
+    if (!parsed || typeof parsed !== 'object') throw new HttpError(`没能生成团队，模型返回：${clampText(result.text, 300)}`, 502)
+    const group = parsed.group && typeof parsed.group === 'object'
+      ? {
+          name: clampText(typeof parsed.group.name === 'string' ? parsed.group.name.trim() : '', 40).trim(),
+          description: clampText(typeof parsed.group.description === 'string' ? parsed.group.description.trim() : '', 200).trim(),
+        }
+      : null
+    const roles = (Array.isArray(parsed.roles) ? parsed.roles : [])
+      .slice(0, MAX_ROLES)
+      .map((item, index) => ({
+        id: `team-role-${index}`,
+        name: clampText(typeof item?.name === 'string' ? item.name.trim() : '', 40).trim(),
+        focus: clampText(typeof item?.focus === 'string' ? item.focus.trim() : '', 60).trim(),
+        persona: clampText(typeof item?.persona === 'string' ? item.persona.trim() : '', 1400).trim(),
+        tags: Array.isArray(item?.tags) ? item.tags.map((tag) => clampText(typeof tag === 'string' ? tag : '', 20)).filter(Boolean).slice(0, 4) : [],
+      }))
+      .filter((item) => item.name)
+    if (!group?.name) throw new HttpError(`模型没有给出可用的分组名：${clampText(result.text, 300)}`, 502)
+    if (roles.length < 2) throw new HttpError(`只生成了 ${roles.length} 个角色，至少需要 2 个可用角色。`, 502)
+    return respond({
+      reply: clampText(typeof parsed?.reply === 'string' ? parsed.reply : '', 1200),
+      mode: skeleton ? 'skeleton' : 'full',
+      group,
+      roles,
+    })
+  })
+
+  route('/assist/revise', ['POST'], async (request) => {
+    await loadState()
+    const body = await readBody(request)
+    const instruction = clampText(typeof body?.instruction === 'string' ? body.instruction.trim() : '', 600).trim()
+    if (instruction.length < 2) throw new HttpError('请说明要往哪个方向改。')
+    const targets = state.roles.filter((role) => Array.isArray(body?.roleIds) && body.roleIds.includes(role.id))
+    if (!targets.length) throw new HttpError('请先选中要修改的角色（或选中整个分组）。', 409)
+    if (targets.length > MAX_ROLES) throw new HttpError(`一次最多改写 ${MAX_ROLES} 个角色。`)
+    const scopeLabel = Array.isArray(body?.groupIds) && body.groupIds.length
+      ? `分组：${state.groups.filter((group) => body.groupIds.includes(group.id)).map((group) => group.name).join('、')}`
+      : '指定角色'
+    const result = await callModel(ctx, {
+      system: TEAM_REVISE_SYSTEM,
+      user: [
+        `【修改范围】${scopeLabel}，共 ${targets.length} 个角色`,
+        targets.map((role) => `--- id: ${role.id}\n名称：${role.name}\n关注点：${role.focus || '（无）'}\n现有人设：${role.persona}`).join('\n'),
+        `【用户的修改要求】\n${instruction}`,
+      ].join('\n\n'),
+      maxTokens: Math.min(2400, 260 + targets.length * 320),
+      temperature: 0.4,
+    })
+    const parsed = extractJson(result.text)
+    if (!parsed || typeof parsed !== 'object') throw new HttpError(`没能生成改写结果，模型返回：${clampText(result.text, 300)}`, 502)
+    const byId = new Map(targets.map((role) => [role.id, role]))
+    const revised = (Array.isArray(parsed.roles) ? parsed.roles : [])
+      .map((item) => {
+        const id = typeof item?.id === 'string' ? item.id.trim() : ''
+        const before = byId.get(id)
+        if (!before) return null
+        return {
+          id,
+          name: clampText(typeof item?.name === 'string' ? item.name.trim() : '', 40).trim() || before.name,
+          focus: clampText(typeof item?.focus === 'string' ? item.focus.trim() : '', 60).trim() || before.focus,
+          persona: clampText(typeof item?.persona === 'string' ? item.persona.trim() : '', 1400).trim(),
+          changed: clampText(typeof item?.changed === 'string' ? item.changed.trim() : '', 200).trim(),
+          before: { name: before.name, focus: before.focus, persona: before.persona },
+        }
+      })
+      .filter((item) => item && item.persona.length >= 20)
+    if (!revised.length) throw new HttpError(`改写结果为空（模型没有返回可用人设）：${clampText(result.text, 300)}`, 502)
+    const missing = targets.filter((role) => !revised.some((item) => item.id === role.id)).map((role) => role.name)
+    return respond({
+      reply: clampText(typeof parsed?.reply === 'string' ? parsed.reply : '', 1000),
+      revised,
+      missing,
+    })
+  })
+
+  // ---- batch commit: apply a whole team, or a set of revisions, in one write ----
+
+  route('/library/apply', ['POST'], async (request) => {
+    await loadState()
+    const body = await readBody(request)
+    const nextGroups = normalizeGroups(body?.groups ?? state.groups)
+    const nextRoles = normalizeRoles(body?.roles ?? state.roles, nextGroups)
+    state.groups = nextGroups
+    state.roles = nextRoles
+    await store.saveGroups(nextGroups)
+    await store.saveRoles(nextRoles)
+    return respond({ groups: nextGroups, roles: nextRoles })
+  })
+
+  // ---- model tools: let the roundtable agent manage the library itself ----
+
+  registerLibraryTools()
+
+  async function registerLibraryTools() {
+    await loadState()
+    const tools = ctx.get('tools')
+    if (tools === undefined) return
+
+    const describeLibrary = async () => {
+      await loadState()
+      return state
+    }
+
+    const applyLibrary = async (groups, roles) => {
+      const nextGroups = normalizeGroups(groups)
+      const nextRoles = normalizeRoles(roles, nextGroups)
+      state.groups = nextGroups
+      state.roles = nextRoles
+      await store.saveGroups(nextGroups)
+      await store.saveRoles(nextRoles)
+      return { groups: nextGroups, roles: nextRoles }
+    }
+
+    ctx.effect(() => {
+      const disposers = []
+
+      disposers.push(
+        tools.register({
+          name: 'roundtable_library',
+          description:
+            '议题圆桌的角色库：读取分组与角色，或在一个调用里整体替换它们。' +
+            '创建团队时先用 assist 生成内容，再把这个工具写回；修改时先读、再改、再整体写回。',
+          parameters: {
+            type: 'object',
+            properties: {
+              action: { type: 'string', enum: ['read', 'write'], description: 'read 读取当前分组与角色；write 用 groups+roles 整体替换' },
+              groups: {
+                type: 'array',
+                description: 'write 时必填：完整的分组列表（第一个分组会成为新角色的默认分组）',
+                items: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'string', description: '已有分组请原样带回 id；新建可省略' },
+                    name: { type: 'string', description: '分组名，2~8 字' },
+                    description: { type: 'string', description: '这个组负责哪类决策' },
+                  },
+                  required: ['name'],
+                },
+              },
+              roles: {
+                type: 'array',
+                description: 'write 时必填：完整的角色列表（不在列表里的角色会被删除）',
+                items: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'string', description: '已有角色请原样带回 id；新建可省略' },
+                    name: { type: 'string', description: '角色名，2~8 字' },
+                    focus: { type: 'string', description: '关注点，不超过 12 字' },
+                    persona: { type: 'string', description: '立场与说话方式，120~200 字，第二人称「你」' },
+                    groupId: { type: 'string', description: '所属分组 id；省略则进第一个分组' },
+                  },
+                  required: ['name', 'persona'],
+                },
+              },
+            },
+            required: ['action'],
+          },
+          async execute(args) {
+            if (args?.action !== 'write') {
+              const current = await describeLibrary()
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: JSON.stringify({ groups: current.groups, roles: current.roles }),
+                  },
+                ],
+              }
+            }
+            if (!Array.isArray(args?.groups) || !Array.isArray(args?.roles)) {
+              throw new Error('write 需要同时给出 groups 与 roles 两个数组。')
+            }
+            const applied = await applyLibrary(args.groups, args.roles)
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `已保存：${applied.groups.length} 个分组、${applied.roles.length} 个角色。分组：${applied.groups
+                    .map((group) => `${group.name}(${applied.roles.filter((role) => role.groupId === group.id).length})`)
+                    .join('、')}`,
+                },
+              ],
+            }
+          },
+        }),
+      )
+
+      disposers.push(
+        tools.register({
+          name: 'roundtable_team',
+          description:
+            '为议题圆桌设计一个角色分组及其全部角色（例如「个股投研组」）。' +
+            '返回候选分组与角色，供你核对；确认后用 roundtable_library 的 write 落库。',
+          parameters: {
+            type: 'object',
+            properties: {
+              scenario: { type: 'string', description: '这个团队要覆盖的决策场景，例如「个股投研：判断某只股票值不值得买」' },
+              mode: {
+                type: 'string',
+                enum: ['full', 'skeleton'],
+                description: 'full 写满人设；skeleton 只出名称与关注点，便于用户在面板里补全',
+              },
+            },
+            required: ['scenario'],
+          },
+          async execute(args) {
+            const scenario = clampText(typeof args?.scenario === 'string' ? args.scenario.trim() : '', 1200).trim()
+            if (scenario.length < 2) throw new Error('请给出这个团队要覆盖的决策场景。')
+            const skeleton = args?.mode === 'skeleton'
+            const current = await describeLibrary()
+            const result = await callModel(ctx, {
+              system: TEAM_ASSIST_SYSTEM,
+              user: [
+                `【用户想要的团队】\n${scenario}`,
+                current.groups.length ? `【已有分组（避免重名）】\n${current.groups.map((group) => group.name).join('、')}` : '',
+                current.roles.length ? `【已有角色（避免重复视角）】\n${current.roles.map((role) => role.name).join('、')}` : '',
+                skeleton
+                  ? '【输出模式】只出框架：persona 允许留空字符串，但 name 与 focus 必须给全，reply 里说明每个角色打算怎么发言。'
+                  : '【输出模式】完整人设：每个角色的 persona 必须写满 120~200 字。',
+              ]
+                .filter(Boolean)
+                .join('\n\n'),
+              maxTokens: skeleton ? 700 : 2000,
+              temperature: 0.6,
+            })
+            const parsed = extractJson(result.text)
+            if (!parsed?.group?.name) throw new Error(`模型没有给出可用的分组：${clampText(result.text, 300)}`)
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    reply: clampText(typeof parsed.reply === 'string' ? parsed.reply : '', 800),
+                    group: { name: clampText(parsed.group.name, 40), description: clampText(parsed.group.description ?? '', 200) },
+                    roles: (Array.isArray(parsed.roles) ? parsed.roles : []).slice(0, MAX_ROLES).map((item) => ({
+                      name: clampText(item?.name ?? '', 40),
+                      focus: clampText(item?.focus ?? '', 60),
+                      persona: clampText(item?.persona ?? '', 1400),
+                    })),
+                  }),
+                },
+              ],
+            }
+          },
+        }),
+      )
+
+      return () => {
+        for (const dispose of disposers) dispose()
+      }
+    }, 'issue-roundtable: library tools')
+  }
 
   ctx.effect(
     () => () => {

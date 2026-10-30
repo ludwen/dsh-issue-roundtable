@@ -120,6 +120,26 @@ globalThis.fetch = async (url, init = {}) => {
     payload = prior
       ? { reply: '信息够了，已定稿。', ready: true, draft: { title: '是否在 Q1 内投入 300 万把移动端迁到 H5', background: '原生双端维护成本高。', goal: '决定是否投入与节奏', checklist: ['预算 300 万为假设'] } }
       : { reply: '先确认：时间窗有多长？', ready: false, draft: { title: '是否迁移移动端到 H5', background: '', goal: '', checklist: ['时间窗待确认'] } }
+  } else if (path.startsWith('/assist/team')) {
+    payload = {
+      reply: '覆盖宏观、行业、基本面、量化、风控五个互补视角。',
+      mode: 'full',
+      group: { name: '个股投研', description: '判断某只股票值不值得买' },
+      roles: [
+        { id: 't1', name: '宏观策略师', focus: '周期与流动性', persona: '你从上层的周期与流动性看个股，先判断时点，再用宏观假设压过公司故事，习惯用数字反驳乐观估计。' },
+        { id: 't2', name: '基本面分析师', focus: '财报质量', persona: '你只看财报与经营数据：收入质量、现金流与资本开支回报，会用比率反驳没有数字支撑的故事。' },
+      ],
+    }
+  } else if (path.startsWith('/assist/revise')) {
+    const body = JSON.parse(init.body)
+    payload = {
+      reply: '统一提高了保守程度。',
+      revised: body.roleIds.map((id) => {
+        const role = state.roles.find((item) => item.id === id)
+        return { id, name: role.name, focus: role.focus, persona: '你改写后更保守：任何乐观假设都要先给出下行情形与止损条件，并用数字说明能承受多大回撤。', changed: '加入下行情形', before: { name: role.name, focus: role.focus, persona: role.persona } }
+      }),
+      missing: [],
+    }
   } else if (path.startsWith('/assist/role')) {
     payload = { suggestions: [{ id: 's1', name: '安全负责人', focus: '数据与攻击面', persona: '你只关心数据流向与权限边界，会先用最坏情况反驳乐观估计。' }] }
   } else if (path.startsWith('/issue/create')) {
@@ -316,7 +336,7 @@ click(findByText('.rtr-lib-group', '风险与合规'))
 await wait(100)
 check('按分组过滤角色', host.querySelectorAll('.rtr-lib-role').length === 1, host.querySelectorAll('.rtr-lib-role').length)
 
-click(findByText('.rtr-btn-primary', '新建角色'))
+click(findByText('.rtr-list-head .rtr-btn', '新建角色'))
 await wait(150)
 type(host.querySelector('.rtr-lib-form .rtr-assist input.rtr-input'), '我需要一个懂安全的人')
 await wait(80)
@@ -327,6 +347,56 @@ click(host.querySelector('.rtr-suggestion'))
 await wait(100)
 check('点候选填入表单', host.querySelector('.rtr-lib-form').textContent.includes('安全负责人'), null)
 check('角色表单有分组下拉', Boolean(host.querySelector('.rtr-lib-form select')), null)
+
+// ---- team wizard: design a whole group in one shot ----
+click(findByText('.rtr-list-head .rtr-btn-primary', 'AI 建团队'))
+await wait(150)
+check('团队向导打开', Boolean(host.querySelector('.rtr-lib-form .rtr-assist')), null)
+type(host.querySelector('.rtr-lib-form textarea.rtr-textarea'), '我想建一个个股投研组')
+await wait(80)
+click(findByText('.rtr-assist .rtr-btn-primary', '生成整组角色'))
+await wait(300)
+check('生成整组预览', host.querySelectorAll('.rtr-team-role').length === 2, host.querySelectorAll('.rtr-team-role').length)
+check('预览可改分组名', Boolean(host.querySelector('.rtr-team-head input.rtr-input')), null)
+check('预览显示 AI 说明', host.querySelector('.rtr-team-preview').textContent.includes('互补视角'), null)
+const groupNameBox = host.querySelector('.rtr-team-head input.rtr-input')
+inputSetter.call(groupNameBox, '个股投研组')
+groupNameBox.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+await wait(60)
+click(findByText('.rtr-team-preview .rtr-btn-primary', '确认并创建整组'))
+await wait(300)
+check('整组一次落库（分组数 +1）', state.groups.some((group) => group.name === '个股投研组'), state.groups.map((g) => g.name))
+check('整组角色全部落库', state.roles.filter((role) => role.name === '宏观策略师' || role.name === '基本面分析师').length === 2, state.roles.length)
+check('落库后回到普通列表', !host.querySelector('.rtr-team-role'), null)
+
+// ---- multi-select a group, then rewrite that scope in one instruction ----
+click(findByText('.rtr-lib-group', '核心决策'))
+await wait(100)
+const groupChecks = [...host.querySelectorAll('.rtr-lib-group-row .rtr-group-check input')]
+check('分组可勾选', groupChecks.length >= 2, groupChecks.length)
+click(groupChecks[0])
+await wait(120)
+check('勾选整组后出现选择栏', Boolean(host.querySelector('.rtr-selection-bar')), null)
+check('选择栏显示包含整组', host.querySelector('.rtr-selection-bar').textContent.includes('整组'), host.querySelector('.rtr-selection-bar').textContent)
+
+const instr = host.querySelector('.rtr-selection-bar input.rtr-input')
+inputSetter.call(instr, '整体更保守，都要先问下行风险')
+instr.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+await wait(60)
+click(findByText('.rtr-selection-bar .rtr-btn-primary', '生成改写'))
+await wait(300)
+check('改写预览出现', host.querySelectorAll('.rtr-diff').length >= 2, host.querySelectorAll('.rtr-diff').length)
+check('预览有前后对照', host.querySelectorAll('.rtr-diff-old').length === host.querySelectorAll('.rtr-diff-new').length, null)
+check('预览可逐个勾选', host.querySelectorAll('.rtr-diff input[type=checkbox]').length >= 2, null)
+
+// uncheck one, apply the rest
+click(host.querySelectorAll('.rtr-diff input[type=checkbox]')[0])
+await wait(80)
+click(findByText('.rtr-team-preview .rtr-btn-primary', '应用勾选的改写'))
+await wait(300)
+check('改写只落到勾选的角色', state.roles.some((role) => role.persona.includes('更保守')), null)
+check('未勾选的角色保持原人设', state.roles.some((role) => role.persona.includes('你从用户价值出发')), null)
+check('应用后预览关闭', !host.querySelector('.rtr-diff'), null)
 
 // ---- layout guards ----
 check('根容器无横向溢出', host.scrollWidth <= host.clientWidth + 1, { scrollWidth: host.scrollWidth, clientWidth: host.clientWidth })
@@ -359,3 +429,7 @@ const failed = results.filter((item) => !item.ok).length
 console.log(`\n${results.length - failed}/${results.length} 项通过`)
 root.unmount()
 if (failed) process.exitCode = 1
+
+
+
+

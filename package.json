@@ -1,7 +1,7 @@
 {
   "name": "dsh-issue-roundtable",
-  "version": "0.2.0",
-  "description": "议题圆桌：圆桌图形界面 + 角色分组与发言顺序 + AI 起草议题/角色 + 多轮讨论与全体投票表决。An issue roundtable workbench for DSH Desktop.",
+  "version": "0.3.0",
+  "description": "议题圆桌：圆桌图形界面 + 分组角色库 + Agent 建团队/批量改写 + 多轮讨论与全体投票表决。An issue roundtable workbench for DSH Desktop.",
   "type": "module",
   "main": "dsh/index.js",
   "scripts": {

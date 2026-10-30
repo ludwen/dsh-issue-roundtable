@@ -53,8 +53,11 @@ const expected = [
   'issue/clear-conclusion',
   'assist/issue',
   'assist/role',
+  'assist/team',
+  'assist/revise',
+  'library/apply',
 ]
-check('注册了全部 13 条路由', expected.every((name) => routes.has(`/api/issue-roundtable/${name}`)), [...routes.keys()].sort())
+check('注册了全部 16 条路由', expected.length === 16 && expected.every((name) => routes.has(`/api/issue-roundtable/${name}`)), [...routes.keys()].sort())
 
 const state = routes.get('/api/issue-roundtable/state')
 const response = await state.fetch(new Request('http://127.0.0.1/api/issue-roundtable/state'))
@@ -106,3 +109,4 @@ dispose?.()
 await rm(root, { recursive: true, force: true })
 console.log(`\n${failures ? 'FAILED' : '全部通过'}`)
 if (failures) process.exitCode = 1
+

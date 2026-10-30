@@ -1,8 +1,14 @@
+// Panel test in jsdom: renders the real client bundle, drives the list / wizard /
+// detail / library flows, and asserts the roundtable, transcript controls and
+// long-text handling. No DSH host, no network, no real model.
+//
+//   node test/panel.mjs
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 
 const P = 'C:/Users/11018790/AppData/Local/Temp/asar-extract/node_modules'
 const require = createRequire(`${P}/x.js`)
+const CLIENT = 'D:/myprojects/dsh-workbench/lib/client.js'
 
 const { JSDOM } = require(`${P}/jsdom`)
 const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { url: 'http://127.0.0.1:43129/' })
@@ -17,109 +23,125 @@ const reactDomClient = require(`${P}/react-dom/client`)
 globalThis.React = react
 const e = react.createElement
 
-const responses = { state: null, run: null, started: null }
-const state = {
-  roles: [
-    { id: 'product', name: '产品经理', focus: '用户价值与需求', persona: '我关心用户价值与体验，反对没有依据的需求想象，习惯用具体场景说话。' },
-    { id: 'engineering', name: '技术负责人', focus: '可行性与长期成本', persona: '我关心实现路径、依赖和可回滚性，拒绝先上再补的空头承诺。' },
-    { id: 'finance', name: '财务负责人', focus: '预算与投入产出', persona: '我只关心钱从哪来、花多少、多久能看到回报，要求拆成一次性与持续成本。' },
-  ],
-  settings: { rounds: 3, research: true, roleIds: ['product', 'engineering', 'finance'] },
-  model: { provider: 'fake', model: 'fake-1' },
-  maxRounds: 5,
-  activeRun: null,
-  history: [
-    {
-      id: 'run-old',
-      topic: '是否把移动端改成 H5，预算 300 万',
-      status: 'done',
-      conclusionTitle: '稳健方案',
-      participants: ['产品经理', '技术负责人'],
-      createdAt: '2026-10-30T00:00:00Z',
-      finishedAt: '2026-10-30T00:10:00Z',
-    },
-  ],
-}
+// ------------------------------------------------------------------ fake host
 
-function runPayload(status) {
+const roles = [
+  { id: 'product', groupId: 'core', name: '产品经理', focus: '用户价值', persona: '你从用户价值出发考虑问题，反对没有依据的需求想象；习惯用一个具体场景说明观点。' },
+  { id: 'engineering', groupId: 'core', name: '技术负责人', focus: '可行性', persona: '你判断可行性与长期维护成本，会指出别人方案里被低估的复杂度，拒绝先上再补。' },
+  { id: 'legal', groupId: 'risk', name: '法务顾问', focus: '合规边界', persona: '你盯住合规红线与责任归属，把「能不能做」拆成「在什么前提下能做」。' },
+]
+const groups = [
+  { id: 'core', name: '核心决策', description: '产品与技术' },
+  { id: 'risk', name: '风险与合规', description: '法务与安全' },
+]
+
+const longSpeech = Array.from({ length: 6 }, (_, index) => `第${index + 1}段：这是很长的一段发言，用来验证折叠与全文展示是否好用。`).join('\n')
+
+function makeIssue(overrides = {}) {
+  const turns = []
+  for (let round = 1; round <= 3; round += 1) {
+    for (const role of roles.slice(0, 2)) {
+      turns.push({ round, roleId: role.id, roleName: role.name, focus: role.focus, text: longSpeech, at: `2026-10-30T0${round}:00:00Z` })
+    }
+  }
   return {
-    id: 'run-new',
-    topic: '我们是否要在明年把移动端从原生改成 H5，预算上限 300 万',
-    status,
-    stage: status === 'done' ? 'result' : 'debate',
-    round: status === 'done' ? 2 : 1,
-    totalRounds: 2,
+    id: 'issue-1',
+    title: '是否在 Q1 内投入 300 万把移动端从原生迁到 H5',
+    background: '原生双端维护成本高。',
+    goal: '决定是否投入与节奏',
+    checklist: ['预算 300 万为假设'],
+    participants: roles.slice(0, 2).map((role) => ({ roleId: role.id, name: role.name, focus: role.focus })),
+    plannedRounds: 3,
+    round: 3,
+    turns,
+    status: 'discussing',
+    stage: 'idle',
     researchEnabled: true,
-    participants: state.roles.map((role) => ({ id: role.id, name: role.name, focus: role.focus })),
-    research: { available: true, note: '已检索到 2 条资料。', queries: ['x'], sources: [{ url: 'https://example.com/a', title: '示例资料', snippet: '背景摘要' }] },
-    turns: [
-      { round: 1, roleId: 'product', roleName: '产品经理', focus: '用户价值', text: '我认为先验证再用场景说话。' },
-      { round: 1, roleId: 'engineering', roleName: '技术负责人', focus: '可行性', text: 'H5 的可回滚性更好，我支持分批迁移。' },
-      { round: 2, roleId: 'product', roleName: '产品经理', focus: '用户价值', text: '复述一下，我接受分批。' },
-      { round: 2, roleId: 'engineering', roleName: '技术负责人', focus: '可行性', text: '' , error: '这次发言失败：超时' },
-    ],
-    speaking: status === 'running' ? { round: 2, roleId: 'finance', roleName: '财务负责人', startedAt: new Date().toISOString() } : null,
-    proposals: status === 'done'
-      ? [
-          { id: 'A', title: '激进方案', summary: '一次投入全部预算，三个月内完成迁移。', keyPoints: ['一次到位', '风险高'], tradeoffs: '前期压力大' },
-          { id: 'B', title: '稳健方案', summary: '先做 10% 灰度，验证后再扩大。', keyPoints: ['先验证'], tradeoffs: '见效慢' },
-        ]
-      : [],
-    votes: status === 'done'
-      ? [
-          { roleId: 'product', roleName: '产品经理', label: '表决', runoff: false, proposalId: 'B', reason: '风险可控。', abstain: false },
-          { roleId: 'finance', roleName: '财务负责人', label: '表决', runoff: false, proposalId: 'A', reason: '一次性预算更容易核算。', abstain: false },
-          { roleId: 'engineering', roleName: '技术负责人', label: '表决', runoff: false, proposalId: null, reason: '投票失败：格式错误', abstain: true },
-        ]
-      : [],
+    research: { available: true, note: '已检索 1 条资料。', sources: [{ url: 'https://example.com/a', title: '示例资料' }] },
+    proposals: [],
+    votes: [],
     runoffVotes: [],
-    tally: status === 'done'
-      ? { counts: { A: 1, B: 1 }, voters: { A: ['财务负责人'], B: ['产品经理'] }, abstain: 1, winnerId: 'B', tie: false, tiedIds: ['A', 'B'] }
-      : null,
-    conclusion: status === 'done'
-      ? {
-          proposalId: 'B',
-          title: '稳健方案',
-          summary: '先做 10% 灰度，验证后再扩大。',
-          keyPoints: ['先验证', '周期长'],
-          tradeoffs: '见效慢',
-          counts: { A: 1, B: 1 },
-          voters: { A: ['财务负责人'], B: ['产品经理'] },
-          abstain: 1,
-          dissent: [{ roleName: '财务负责人', proposalId: 'A', reason: '一次性预算更容易核算。' }],
-          openQuestions: ['灰度指标怎么定？'],
-          decidedAt: '2026-10-30T00:10:00Z',
-          note: '按多数票产生结论。',
-        }
-      : null,
-    error: '',
-    usage: [],
+    tally: null,
+    conclusion: null,
     model: { provider: 'fake', model: 'fake-1' },
-    startedAt: '2026-10-30T00:00:00Z',
-    finishedAt: status === 'done' ? '2026-10-30T00:10:00Z' : null,
-    updatedAt: '2026-10-30T00:10:00Z',
-    elapsedMs: 600000,
+    createdAt: '2026-10-30T00:00:00Z',
+    updatedAt: '2026-10-30T00:20:00Z',
+    ...overrides,
   }
 }
 
-let currentRunStatus = 'running'
+const concluded = makeIssue({
+  status: 'decided',
+  proposals: [
+    { id: 'A', title: '激进方案', summary: '一次投入全部预算。', keyPoints: ['一次到位'], tradeoffs: '压力大' },
+    { id: 'B', title: '稳健方案', summary: '先做 10% 灰度。', keyPoints: ['先验证'], tradeoffs: '见效慢' },
+  ],
+  votes: [
+    { roleId: 'product', roleName: '产品经理', proposalId: 'B', reason: '风险可控。' },
+    { roleId: 'engineering', roleName: '技术负责人', proposalId: 'A', reason: '一次性投入更容易估算。' },
+  ],
+  tally: { counts: { A: 1, B: 1 }, voters: { A: ['技术负责人'], B: ['产品经理'] }, abstain: 0, winnerId: 'B', tie: false, tiedIds: ['A', 'B'] },
+  conclusion: {
+    proposalId: 'B',
+    title: '稳健方案',
+    summary: '先做 10% 灰度，验证后再扩大。',
+    keyPoints: ['先验证'],
+    counts: { A: 1, B: 1 },
+    dissent: [{ roleName: '技术负责人', proposalId: 'A', reason: '一次性投入更容易估算。' }],
+    openQuestions: ['灰度指标怎么定？'],
+    note: '按多数票产生结论。',
+    stale: false,
+  },
+})
+
+let issueState = makeIssue()
+const state = {
+  groups,
+  roles,
+  issues: [
+    { id: 'issue-1', title: '是否在 Q1 内投入 300 万把移动端从原生迁到 H5', goal: '决定是否投入与节奏', status: 'discussing', round: 3, plannedRounds: 3, turnCount: 6, updatedAt: '2026-10-30T00:20:00Z', participants: roles.slice(0, 2).map((r) => ({ id: r.id, name: r.name, focus: r.focus })), conclusionTitle: '', conclusionStale: false },
+    { id: 'issue-2', title: '要不要上自动化测试', goal: '决定投入方式', status: 'decided', round: 2, plannedRounds: 2, turnCount: 4, updatedAt: '2026-10-29T00:00:00Z', participants: [{ id: 'engineering', name: '技术负责人' }], conclusionTitle: '稳健方案', conclusionStale: false },
+  ],
+  model: { provider: 'fake', model: 'fake-1' },
+  runningIssueId: null,
+  limits: { maxRoles: 12, maxRounds: 8, maxParticipants: 8 },
+}
+
+const calls = []
 globalThis.fetch = async (url, init = {}) => {
-  const path = String(url)
-  if (path.startsWith('/api/issue-roundtable/run')) return { ok: true, status: 200, json: async () => ({ run: runPayload(currentRunStatus) }) }
-  if (path.startsWith('/api/issue-roundtable/start')) return { ok: true, status: 200, json: async () => ({ runId: 'run-new', run: runPayload('running') }) }
-  if (path.startsWith('/api/issue-roundtable/cancel')) return { ok: true, status: 200, json: async () => ({ cancelled: true }) }
-  if (path.startsWith('/api/issue-roundtable/debate')) return { ok: true, status: 200, json: async () => ({ debate: runPayload('done') }) }
-  if (path.startsWith('/api/issue-roundtable/delete')) return { ok: true, status: 200, json: async () => ({ deleted: true }) }
-  if (path.startsWith('/api/issue-roundtable/roles')) return { ok: true, status: 200, json: async () => ({ roles: state.roles }) }
-  if (path.startsWith('/api/issue-roundtable/settings')) return { ok: true, status: 200, json: async () => ({ settings: state.settings }) }
-  return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(state)) }
-  void init
+  const path = String(url).replace('/api/issue-roundtable', '')
+  calls.push({ path, method: init.method ?? 'GET' })
+  let payload = {}
+  if (path.startsWith('/state')) payload = state
+  else if (path.startsWith('/issue?id=')) payload = { issue: issueState, summary: {} }
+  else if (path.startsWith('/assist/issue')) {
+    const body = JSON.parse(init.body)
+    const prior = (body.history ?? []).length
+    payload = prior
+      ? { reply: '信息够了，已定稿。', ready: true, draft: { title: '是否在 Q1 内投入 300 万把移动端迁到 H5', background: '原生双端维护成本高。', goal: '决定是否投入与节奏', checklist: ['预算 300 万为假设'] } }
+      : { reply: '先确认：时间窗有多长？', ready: false, draft: { title: '是否迁移移动端到 H5', background: '', goal: '', checklist: ['时间窗待确认'] } }
+  } else if (path.startsWith('/assist/role')) {
+    payload = { suggestions: [{ id: 's1', name: '安全负责人', focus: '数据与攻击面', persona: '你只关心数据流向与权限边界，会先用最坏情况反驳乐观估计。' }] }
+  } else if (path.startsWith('/issue/create')) {
+    const body = JSON.parse(init.body)
+    payload = { issue: { ...makeIssue(), id: 'issue-new', title: body.title, turns: [], round: 0, status: 'draft', conclusion: null, proposals: [] } }
+  } else if (path.startsWith('/issue/continue')) {
+    issueState = makeIssue({ plannedRounds: 5, round: 5 })
+    payload = { issue: issueState }
+  } else if (path.startsWith('/issue/')) payload = { issue: issueState }
+  else if (path.startsWith('/library')) {
+    const body = JSON.parse(init.body)
+    Object.assign(state, { groups: body.groups, roles: body.roles })
+    payload = { groups: body.groups, roles: body.roles }
+  }
+  return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(payload)) }
 }
 
 // ---------------------------------------------------------------- load panel
+
 const captured = []
 window.__ModuleLoader__ = { load: (entry) => captured.push(entry) }
-new Function('window', 'document', readFileSync('D:/myprojects/dsh-workbench/lib/client.js', 'utf8'))(window, document)
+new Function('window', 'document', readFileSync(CLIENT, 'utf8'))(window, document)
 const mod = captured[0].factory((name) => (name === 'react' ? react : require(name)))
 
 const registered = {}
@@ -135,65 +157,202 @@ mod.apply({
 })
 
 const host = document.createElement('div')
-host.style.width = '820px'
+host.style.width = '960px'
 document.body.appendChild(host)
 const root = reactDomClient.createRoot(host)
-root.render(e(registered.Component, { active: true, service: {}, entry: registered.descriptor, conversation: null }))
+root.render(e(registered.Component, { active: true, service: {}, entry: registered.descriptor }))
 
-const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const wait = (ms = 120) => new Promise((resolve) => setTimeout(resolve, ms))
 const text = () => host.textContent.replace(/\s+/g, ' ')
 const results = []
-const check = (name, condition, detail) => results.push({ name, ok: Boolean(condition), detail })
+const check = (name, ok, detail) => results.push({ name, ok: Boolean(ok), detail })
+const click = (node) => node?.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))
+const findByText = (selector, needle) => [...host.querySelectorAll(selector)].find((node) => node.textContent.includes(needle))
+const inputSetter = Object.getOwnPropertyDescriptor(dom.window.HTMLInputElement.prototype, 'value').set
+const areaSetter = Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, 'value').set
+const type = (node, value) => {
+  if (!node) throw new Error('type() received a missing node')
+  const setter = node.tagName === 'TEXTAREA' ? areaSetter : inputSetter
+  setter.call(node, value)
+  node.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+}
 
-await wait(150)
-check('业务面板唯一紧凑工具栏', host.querySelectorAll('[data-dsh-workbench-toolbar]').length === 1)
-check('CSS 注入一次', document.querySelectorAll('style[data-issue-roundtable]').length === 1)
-check('首页显示角色卡片', host.querySelectorAll('.rtr-role').length === 3, host.querySelectorAll('.rtr-role').length)
-check('首页显示历史讨论', host.querySelectorAll('.rtr-history-item').length === 1)
-check('议题为空时开始按钮禁用', [...host.querySelectorAll('button')].find((b) => b.textContent.includes('开始圆桌讨论'))?.disabled === true)
+await wait(200)
 
-// type a topic
-const area = host.querySelector('textarea.rtr-textarea')
-const setter = Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, 'value').set
-setter.call(area, '我们是否要在明年把移动端从原生改成 H5，预算上限 300 万')
-area.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+// ---- shell + issue list ----
+check('唯一紧凑工具栏', host.querySelectorAll('[data-dsh-workbench-toolbar]').length === 1)
+check('样式只注入一次', document.querySelectorAll('style[data-issue-roundtable]').length === 1)
+check('议题列表显示 2 条', host.querySelectorAll('.rtr-issue').length === 2, host.querySelectorAll('.rtr-issue').length)
+check('列表项显示角色席位条', host.querySelectorAll('.rtr-strip-seat').length >= 2, host.querySelectorAll('.rtr-strip-seat').length)
+check('列表项显示结论摘要', text().includes('结论：稳健方案'), null)
+check('状态筛选存在', text().includes('待决定') && text().includes('已表决'), null)
+
+click(findByText('.rtr-pill', '已表决'))
 await wait(80)
-check('输入议题后开始按钮可用', [...host.querySelectorAll('button')].find((b) => b.textContent.includes('开始圆桌讨论'))?.disabled === false)
-
-// switch round count
-const roundBtn = [...host.querySelectorAll('button.rtr-pill')].find((b) => b.textContent === '2 轮')
-roundBtn?.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))
-await wait(40)
-
-// start
-const startBtn = [...host.querySelectorAll('button')].find((b) => b.textContent.includes('开始圆桌讨论'))
-startBtn.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))
-await wait(150)
-check('点击开始后进入讨论视图', text().includes('讨论过程'), text().slice(0, 120))
-check('讨论视图显示议题', text().includes('移动端从原生改成 H5'))
-check('进行中显示正在发言', text().includes('正在发言'), text().slice(0, 200))
-check('进行中可取消讨论', Boolean([...host.querySelectorAll('button')].find((b) => b.textContent === '取消讨论')))
-check('背景资料列出检索来源', Boolean(host.querySelector('a[href="https://example.com/a"]')))
-
-// finish the run and let the poller pick it up
-currentRunStatus = 'done'
-await wait(1800)
-check('轮询拿到结束后显示候选方案', host.querySelectorAll('.rtr-proposal').length === 2, host.querySelectorAll('.rtr-proposal').length)
-check('胜出方案被标记', Boolean(host.querySelector('.rtr-proposal[data-winner]')))
-check('投票明细列出弃权', text().includes('弃权'))
-check('表决结果卡片出现', text().includes('表决结果') && text().includes('稳健方案'), text().slice(-160))
-check('少数意见被保留', text().includes('少数意见'), null)
-check('失败发言有单独提示', text().includes('这次发言失败'), null)
-
-// role editor
-const roleButton = [...host.querySelectorAll('button')].find((b) => b.textContent.includes('角色设定'))
-roleButton?.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }))
+check('按状态筛选后只剩已表决', host.querySelectorAll('.rtr-issue').length === 1, host.querySelectorAll('.rtr-issue').length)
+click(findByText('.rtr-pill', '全部'))
 await wait(80)
-check('角色编辑器打开', host.querySelectorAll('.rtr-editor-item').length === 3, host.querySelectorAll('.rtr-editor-item').length)
-check('角色编辑器提示 ai agent', text().includes('每个角色就是一位独立的发言 agent'))
 
-// no horizontal overflow: the panel itself must not force a horizontal scrollbar
+type(host.querySelector('.rtr-search'), '自动化')
+await wait(100)
+check('搜索命中标题', host.querySelectorAll('.rtr-issue').length === 1, host.querySelectorAll('.rtr-issue').length)
+type(host.querySelector('.rtr-search'), '')
+await wait(100)
+
+// ---- issue detail ----
+issueState = makeIssue()
+click(host.querySelectorAll('.rtr-issue-main')[0])
+await wait(200)
+check('详情页出现圆桌', host.querySelectorAll('.rtr-seat').length === 2, host.querySelectorAll('.rtr-seat').length)
+check('圆桌中心有提示气泡', Boolean(host.querySelector('.rtr-bubble')), null)
+check('席位显示发言计数', host.querySelectorAll('.rtr-seat-count').length === 2, host.querySelectorAll('.rtr-seat-count').length)
+check('统计卡显示轮次', text().includes('3/3'), null)
+check('发言记录列出全部 6 条', host.querySelectorAll('.rtr-turn').length === 6, host.querySelectorAll('.rtr-turn').length)
+check('长发言默认折叠', host.querySelectorAll('.rtr-clamped').length === 6, host.querySelectorAll('.rtr-clamped').length)
+
+click(host.querySelectorAll('.rtr-turn-toggle')[0])
+await wait(80)
+check('展开全文后该条不再折叠', host.querySelectorAll('.rtr-clamped').length === 5, host.querySelectorAll('.rtr-clamped').length)
+
+click(host.querySelectorAll('.rtr-seat')[0])
+await wait(120)
+check('点座位可只看该角色', host.querySelectorAll('.rtr-turn').length === 3, host.querySelectorAll('.rtr-turn').length)
+check('筛选提示可见', text().includes('只看「'), null)
+click(findByText('.rtr-btn-ghost', '取消筛选'))
+await wait(100)
+
+click(findByText('.rtr-pill', '第 2 轮'))
+await wait(100)
+check('按轮次筛选只剩 2 条', host.querySelectorAll('.rtr-turn').length === 2, host.querySelectorAll('.rtr-turn').length)
+click(findByText('.rtr-pill', '全部'))
+await wait(100)
+
+click(findByText('.rtr-pill', '详细'))
+await wait(100)
+check('切到紧凑后每条一行', host.querySelectorAll('.rtr-turn[data-dense]').length === 6, host.querySelectorAll('.rtr-turn[data-dense]').length)
+click(findByText('.rtr-pill', '紧凑'))
+await wait(100)
+
+click(findByText('.rtr-pill', '全屏阅读'))
+await wait(100)
+check('全屏阅读抽屉打开', Boolean(host.querySelector('.rtr-drawer')), null)
+check('抽屉内也有完整记录', host.querySelectorAll('.rtr-drawer .rtr-turn').length === 6, host.querySelectorAll('.rtr-drawer .rtr-turn').length)
+click(host.querySelector('.rtr-drawer .rtr-btn-ghost'))
+await wait(80)
+check('抽屉可关闭', !host.querySelector('.rtr-drawer'), null)
+
+click(findByText('.rtr-btn', '继续讨论 +2 轮'))
+await wait(250)
+check('继续讨论调用 /issue/continue', calls.some((call) => call.path === '/issue/continue' && call.method === 'POST'), null)
+check('继续讨论后计划轮数变为 5', text().includes('5/5'), null)
+
+// ---- voted issue ----
+issueState = concluded
+click(findByText('.rtr-btn-ghost', '‹ 返回议题列表'))
+await wait(120)
+click([...host.querySelectorAll('.rtr-issue-main')].find((node) => node.textContent.includes('自动化')))
+await wait(220)
+check('已表决议题显示结论卡', Boolean(host.querySelector('.rtr-conclusion')), null)
+check('结论卡保留少数意见', text().includes('少数意见'), null)
+check('候选方案标出胜出', Boolean(host.querySelector('.rtr-proposal[data-winner]')), null)
+check('投票明细可见', text().includes('投票明细'), null)
+
+// ---- wizard ----
+click(findByText('.rtr-btn-ghost', '‹ 返回议题列表'))
+await wait(120)
+click(findByText('.rtr-btn-primary', '新建议题'))
+await wait(150)
+check('向导默认在 AI 起草', Boolean(host.querySelector('.rtr-assist')), null)
+
+type(host.querySelector('.rtr-chat-input textarea'), '我想讨论要不要把移动端改成 H5')
+await wait(80)
+click(findByText('.rtr-assist .rtr-btn-primary', '发送'))
+await wait(300)
+check('AI 第一轮追问被记录', text().includes('先确认：时间窗有多长？'), null)
+check('助手调用 /assist/issue', calls.some((call) => call.path === '/assist/issue'), null)
+
+// Turn 2 answers the question. The draft then becomes ready, and the wizard
+// is expected to switch itself to the issue editor — so the chat box is gone
+// by design, not by accident.
+type(host.querySelector('.rtr-chat-input textarea'), '预算 300 万，Q1 完成')
+await wait(80)
+click(findByText('.rtr-assist .rtr-btn-primary', '发送'))
+await wait(300)
+check('第二轮定稿后自动切到议题内容', text().includes('希望产出') && !host.querySelector('.rtr-chat-input'), text().slice(0, 200))
+check('定稿标题落进输入框', host.querySelector('.rtr-form input.rtr-input')?.value?.includes('移动端') ?? false,
+  host.querySelector('.rtr-form input.rtr-input')?.value)
+
+click(findByText('.rtr-tab', '角色与顺序'))
+await wait(150)
+check('角色选择按分组展示', host.querySelectorAll('.rtr-roles .rtr-role').length === 3, host.querySelectorAll('.rtr-roles .rtr-role').length)
+click(host.querySelectorAll('.rtr-role')[0])
+await wait(100)
+click(host.querySelectorAll('.rtr-role')[1])
+await wait(100)
+check('选中角色后出现发言顺序', host.querySelectorAll('.rtr-order-item').length === 2, host.querySelectorAll('.rtr-order-item').length)
+check('顺序显示序号徽标', Boolean(host.querySelector('.rtr-order-badge')), null)
+
+const firstName = host.querySelectorAll('.rtr-order-name')[0].textContent
+const downButtons = [...host.querySelectorAll('.rtr-order-item')]
+  .flatMap((item) => [...item.querySelectorAll('button')])
+  .filter((node) => node.textContent === '↓')
+click(downButtons[0])
+await wait(100)
+const afterName = host.querySelectorAll('.rtr-order-name')[0].textContent
+check('可调整发言顺序', firstName !== afterName, { firstName, afterName })
+
+click(findByText('.rtr-form .rtr-pill', '5 轮'))
+await wait(80)
+click(findByText('.rtr-wizard-foot .rtr-btn-primary', '创建议题'))
+await wait(250)
+check('创建调用 /issue/create', calls.some((call) => call.path === '/issue/create' && call.method === 'POST'), null)
+
+// ---- library ----
+click(findByText('.rtr-nav button', '角色库'))
+await wait(200)
+check('角色库列出分组', host.querySelectorAll('.rtr-lib-group').length >= 3, host.querySelectorAll('.rtr-lib-group').length)
+check('角色库列出角色', host.querySelectorAll('.rtr-lib-role').length === 3, host.querySelectorAll('.rtr-lib-role').length)
+click(findByText('.rtr-lib-group', '风险与合规'))
+await wait(100)
+check('按分组过滤角色', host.querySelectorAll('.rtr-lib-role').length === 1, host.querySelectorAll('.rtr-lib-role').length)
+
+click(findByText('.rtr-btn-primary', '新建角色'))
+await wait(150)
+type(host.querySelector('.rtr-lib-form .rtr-assist input.rtr-input'), '我需要一个懂安全的人')
+await wait(80)
+click(findByText('.rtr-lib-form .rtr-assist .rtr-btn', '生成候选'))
+await wait(250)
+check('AI 生成角色候选', host.querySelectorAll('.rtr-suggestion').length === 1, host.querySelectorAll('.rtr-suggestion').length)
+click(host.querySelector('.rtr-suggestion'))
+await wait(100)
+check('点候选填入表单', host.querySelector('.rtr-lib-form').textContent.includes('安全负责人'), null)
+check('角色表单有分组下拉', Boolean(host.querySelector('.rtr-lib-form select')), null)
+
+// ---- layout guards ----
 check('根容器无横向溢出', host.scrollWidth <= host.clientWidth + 1, { scrollWidth: host.scrollWidth, clientWidth: host.clientWidth })
+
+// The roundtable container only belongs to the detail view, so assert it where
+// it is expected rather than from the library view.
+click(findByText('.rtr-nav button', '议题'))
+await wait(150)
+issueState = makeIssue()
+click(host.querySelectorAll('.rtr-issue-main')[0])
+await wait(200)
+check('详情页的圆桌容器具备比例盒子', Boolean(host.querySelector('.rtr-table')), null)
+check('座位沿圆周均匀分布', (() => {
+  const seats = [...host.querySelectorAll('.rtr-seat')]
+  if (seats.length < 2) return false
+  const points = seats.map((seat) => {
+    const left = parseFloat(seat.style.left)
+    const top = parseFloat(seat.style.top)
+    // Every seat sits on the same ellipse: ((x-50)/36)^2 + ((y-50)/34)^2 ≈ 1.
+    const value = ((left - 50) / 36) ** 2 + ((top - 50) / 34) ** 2
+    return Math.abs(value - 1) < 0.02 && left >= 8 && left <= 92 && top >= 8 && top <= 92
+  })
+  const positions = new Set(seats.map((seat) => `${seat.style.left}/${seat.style.top}`))
+  return points.every(Boolean) && positions.size === seats.length
+})(), [...host.querySelectorAll('.rtr-seat')].map((seat) => `${seat.style.left}/${seat.style.top}`))
+check('详情页无横向溢出', host.scrollWidth <= host.clientWidth + 1, { scrollWidth: host.scrollWidth, clientWidth: host.clientWidth })
 
 for (const item of results) console.log(`${item.ok ? 'PASS' : 'FAIL'}  ${item.name}${item.ok ? '' : `  → ${JSON.stringify(item.detail)}`}`)
 const failed = results.filter((item) => !item.ok).length

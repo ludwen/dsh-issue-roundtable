@@ -1,9 +1,13 @@
 {
   "name": "dsh-issue-roundtable",
-  "version": "0.1.0",
-  "description": "议题圆桌：为议题定义多个不同角色的发言者，让它们多轮交锋，最后由全体投票表决出一个方案。An issue roundtable workbench for DSH Desktop.",
+  "version": "0.2.0",
+  "description": "议题圆桌：圆桌图形界面 + 角色分组与发言顺序 + AI 起草议题/角色 + 多轮讨论与全体投票表决。An issue roundtable workbench for DSH Desktop.",
   "type": "module",
   "main": "dsh/index.js",
+  "scripts": {
+    "build": "node scripts/build-client.mjs",
+    "test": "node test/smoke.mjs && node test/panel.mjs"
+  },
   "exports": {
     ".": "./dsh/index.js",
     "./client": "./lib/client.js",
@@ -14,6 +18,8 @@
     "dsh/",
     "lib/",
     "locale/",
+    "src/",
+    "scripts/",
     "cordis.patch.yml",
     "README.md"
   ],

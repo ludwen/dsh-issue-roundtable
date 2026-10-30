@@ -1,19 +1,20 @@
-// Smoke test for the host half: no DSH host, no network.
+// Smoke test for the host half: no DSH host, no network, no real model.
 //   node test/smoke.mjs
 //
-// It mounts the plugin on a fake Cordis context with a scripted fake LLM
-// stream, runs a full debate over the real fetch-route handlers, and asserts
-// transcript, clerk proposals, votes, tally and conclusion.
+// Mounts the plugin on a fake Cordis context with a scripted fake LLM stream,
+// then walks the whole feature set over the real fetch-route handlers:
+// library (groups + roles), issue create/update, rounds, continue past the
+// planned rounds, vote (incl. runoff), AI assist for issue drafting and role
+// design, plus validation and 404 paths.
 
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, defaultRoles, extractJson, normalizeProposals, normalizeRoles } from '../dsh/index.js'
+import { apply, extractJson, normalizeGroups, normalizeProposals, normalizeRoles } from '../dsh/index.js'
 
 let failures = 0
 const checks = []
-
-function check(name, condition, detail) {
+const check = (name, condition, detail) => {
   checks.push({ name, ok: Boolean(condition), detail })
   if (!condition) failures += 1
 }
@@ -29,60 +30,90 @@ function fakeStream(text) {
   })()
 }
 
-const CLERK_REPLY = JSON.stringify({
+const CLERK = JSON.stringify({
   proposals: [
-    { title: '激进方案', summary: '一次投入全部预算，三个月内完成迁移。', keyPoints: ['一次到位', '风险高'], tradeoffs: '前期压力大' },
-    { title: '稳健方案', summary: '先做 10% 灰度，验证后再扩大。', keyPoints: ['先验证', '周期长'], tradeoffs: '见效慢' },
+    { title: '激进方案', summary: '一次投入全部预算，三个月内完成。', keyPoints: ['一次到位'], tradeoffs: '前期压力大' },
+    { title: '稳健方案', summary: '先做 10% 灰度，验证后再扩大。', keyPoints: ['先验证'], tradeoffs: '见效慢' },
   ],
   recommendedId: 'B',
   openQuestions: ['灰度指标怎么定？'],
 })
 
-/** Default script: clerk two proposals, 3 of 4 roles vote B, roles speak by round. */
-function scriptedReply(options) {
+function scripted(options) {
   const system = options.system ?? ''
-  const user = options.user ?? ''
-  if (system.includes('书记员')) return CLERK_REPLY
-  if (system.includes('用一票决定')) {
-    const dissenter = system.includes('用户代表')
-    return JSON.stringify({ proposalId: dissenter ? 'A' : 'B', reason: '按方案的风险可控程度判断。' })
-  }
-  const round = /第 (\d+)\/(\d+) 轮/.exec(user)?.[1] ?? '1'
-  return `（第${round}轮发言）我倾向先小规模验证再扩大投入，因为主要风险集中在后期不可逆成本上。`
-}
-
-/** Tie script: two roles always vote for different proposals. */
-function tieReply(options) {
-  const system = options.system ?? ''
-  if (system.includes('书记员')) {
+  const lastUser = [...(options.messages ?? [])].reverse().find((message) => message.role === 'user')
+  const lastText = lastUser?.content?.[0]?.text ?? ''
+  if (system.includes('议题顾问')) {
+    const userTurns = (options.messages ?? []).filter((message) => message.role === 'user').length
+    if (userTurns <= 1) {
+      return JSON.stringify({
+        reply: '先确认一件事：这次决策的时间窗有多长？',
+        ready: false,
+        draft: { title: '是否在 Q1 内完成移动端迁移', background: '现状为原生双端维护。', goal: '给出可执行的迁移节奏', checklist: ['预算上限待确认'] },
+      })
+    }
     return JSON.stringify({
-      proposals: [{ title: '立即执行', summary: '本月内完成全部动作。' }, { title: '暂缓观察', summary: '保留预算，等下一季度再定。' }],
-      recommendedId: 'B',
-      openQuestions: [],
+      reply: '信息够了，已按 300 万预算与 Q1 时间窗定稿。',
+      ready: true,
+      draft: {
+        title: '是否在 Q1 内投入 300 万把移动端从原生迁到 H5',
+        background: '原生双端维护成本高；H5 可复用一套前端。',
+        goal: '决定是否投入、按什么节奏投入',
+        checklist: ['预算 300 万为假设', '要求可回滚'],
+      },
     })
   }
-  if (system.includes('用一票决定')) {
-    return JSON.stringify({ proposalId: system.includes('技术负责人') ? 'B' : 'A', reason: '立场不同。' })
+  if (system.includes('角色设计师')) {
+    return JSON.stringify({
+      suggestions: [
+        {
+          name: '安全负责人',
+          focus: '数据与攻击面',
+          persona: '你只关心数据流向、权限边界与攻击面，任何方案都要先画出信任边界；你习惯用最坏情况来反驳乐观估计。',
+          tags: ['安全'],
+        },
+        {
+          name: '运维负责人',
+          focus: '上线与稳定性',
+          persona: '你关心上线窗口、回滚路径与监控覆盖，会追问故障时的止损动作；你反对没有演练过的方案。',
+          tags: ['稳定性'],
+        },
+      ],
+    })
   }
-  return '我的发言：两边的说法我都不完全同意。'
+  if (system.includes('书记员')) return CLERK
+  if (system.includes('用一票决定')) {
+    return JSON.stringify({ proposalId: system.includes('财务负责人') || system.includes('用户代表') ? 'A' : 'B', reason: '按风险可控程度判断。' })
+  }
+  const round = /第 (\d+) 轮/.exec(lastText)?.[1] ?? '1'
+  const continued = lastText.includes('追加讨论')
+  return `${continued ? '（追加）' : ''}（第${round}轮发言）我倾向先小规模验证再扩大投入，主要风险在后期不可逆成本。`
 }
 
-function createFakeContext({ root, reply = scriptedReply, web = true }) {
+function createFakeContext({ root, reply = scripted, web = true }) {
   const routes = new Map()
+  const calls = []
   const ctx = {
     logger: { warn: () => {} },
     get(name) {
-      if (name === 'llm') return { stream: (options) => fakeStream(reply(options)) }
+      if (name === 'llm') {
+        return {
+          stream: (options) => {
+            calls.push({ system: (options.system ?? '').slice(0, 12) })
+            return fakeStream(reply(options))
+          },
+        }
+      }
       if (name === 'agentDefaultModel') return { currentSelection: () => ({ provider: 'fake', model: 'fake-1' }) }
       if (name === 'web' && web) {
-        return { search: async () => ({ sources: [{ url: 'https://example.com/a', title: '示例资料', snippet: '一点背景' }], truncated: false }) }
+        return { search: async () => ({ sources: [{ url: 'https://example.com/a', title: '示例资料', snippet: '背景' }], truncated: false }) }
       }
       return undefined
     },
     connection: { fetch: { register: (route) => routes.set(route.path, route) } },
     effect: (factory) => factory(),
   }
-  return { ctx, routes }
+  return { ctx, routes, calls }
 }
 
 async function call(routes, path, { method = 'GET', body } = {}) {
@@ -97,112 +128,157 @@ async function call(routes, path, { method = 'GET', body } = {}) {
   return { status: response.status, data: await response.json() }
 }
 
-async function waitForRun(routes, id, timeoutMs = 8000) {
+async function waitIdle(routes, id, timeoutMs = 20000) {
   const started = Date.now()
   while (Date.now() - started < timeoutMs) {
-    const { data } = await call(routes, `/run?id=${encodeURIComponent(id)}`)
-    if (data.run.status !== 'running') return data.run
-    await new Promise((resolve) => setTimeout(resolve, 60))
+    const { data } = await call(routes, `/issue?id=${encodeURIComponent(id)}`)
+    if (data.issue.status !== 'running' && data.issue.status !== 'voting') return data.issue
+    await new Promise((resolve) => setTimeout(resolve, 40))
   }
-  throw new Error('run did not finish in time')
-}
-
-async function tempRoot(prefix) {
-  return mkdtemp(join(tmpdir(), prefix))
+  throw new Error('issue did not settle in time')
 }
 
 // ---------------------------------------------------------------------- run
 
 async function main() {
-  // --- pure helpers ---
+  // ---- pure helpers ----
   const parsed = extractJson('前言\n```json\n{"proposals":[{"title":"甲","summary":"做甲"}],"recommendedId":"A"}\n```')
   check('extractJson 能穿过代码块与前缀', parsed?.proposals?.[0]?.title === '甲', parsed)
   check('extractJson 容忍尾随逗号', Boolean(extractJson('{"a":[1,2,]}')), null)
+  check('候选方案按出现顺序重编 ID', normalizeProposals([{ title: 'A' }, { title: 'B' }])[1].id === 'B', null)
+  const groups = normalizeGroups([{ name: '甲组' }, { name: '乙组' }, { name: '' }])
+  check('空名分组被丢弃', groups.length === 2, groups)
+  const roles = normalizeRoles([{ name: '甲', persona: '一二三四五六七八九十一二三四五六七八九十', groupId: 'missing' }], groups)
+  check('未知分组回落到第一个分组', roles[0]?.groupId === groups[0].id, roles)
 
-  const proposals = normalizeProposals([{ title: 'A', summary: 'x' }, { title: 'B', summary: 'y' }, { title: '' }])
-  check('候选方案按出现顺序重编 ID', proposals.length === 2 && proposals[1].id === 'B', proposals)
-
-  const roles = normalizeRoles([
-    { name: '甲', persona: '一二三四五六七八九十一二三四五六七八九十' },
-    { name: '甲', persona: '一二三四五六七八九十一二三四五六七八九十' },
-  ])
-  check('重名角色得到不同 ID', roles[0].id !== roles[1].id, roles)
-
-  let rejection = ''
-  try {
-    normalizeRoles([{ name: '甲', persona: '短' }])
-  } catch (error) {
-    rejection = error.message
-  }
-  check('立场太短会被拒绝', rejection.includes('太短'), rejection)
-
-  // --- one full debate: 2 rounds × 4 roles, clerk, 4 votes, conclusion ---
-  const root = await tempRoot('rtr-')
+  // ---- library: groups + roles ----
+  const root = await mkdtemp(join(tmpdir(), 'rtr-'))
   const { ctx, routes } = createFakeContext({ root })
-  apply(ctx, { root, researchMaxResults: 6, maxHistory: 40 })
-  check('注册了 roundtable 路由', routes.has('/api/issue-roundtable/state'), [...routes.keys()])
+  apply(ctx, { root, researchMaxResults: 6, maxIssues: 200, transcriptChars: 14000 })
+  check('注册了 issue-roundtable 路由', routes.has('/api/issue-roundtable/state'), [...routes.keys()].length)
 
   const state = await call(routes, '/state')
-  check('初始角色是内置的四位', state.data.roles.length === 4 && state.data.roles[0].name === defaultRoles()[0].name, state.data.roles)
-  check('初始模型可读', state.data.model?.provider === 'fake', state.data.model)
+  check('内置角色库带分组', state.data.roles.length >= 4 && state.data.groups.length === 3, { roles: state.data.roles.length, groups: state.data.groups.length })
+  check('内置角色都归属到某个分组', state.data.roles.every((role) => state.data.groups.some((group) => group.id === role.groupId)), null)
+  check('state 暴露上限与模型', state.data.limits.maxRounds >= 5 && state.data.model?.provider === 'fake', state.data.limits)
 
-  const started = await call(routes, '/start', {
+  const library = await call(routes, '/library', {
     method: 'POST',
-    body: { topic: '是否把移动端改成 H5，预算 300 万', rounds: 2, roleIds: state.data.roles.map((role) => role.id), research: true },
+    body: {
+      groups: [...state.data.groups, { id: 'ops', name: '运维与安全', description: '上线、稳定性、安全' }],
+      roles: [
+        ...state.data.roles,
+        { id: 'sre', name: '运维负责人', focus: '上线与稳定性', persona: '你关心上线窗口、回滚路径与监控覆盖，会追问故障时的止损动作。', groupId: 'ops' },
+      ],
+    },
   })
-  check('开始讨论返回 runId', started.status === 200 && Boolean(started.data.runId), started.data)
+  check('新增分组与角色保存成功', library.status === 200 && library.data.groups.length === 4 && library.data.roles.length === state.data.roles.length + 1, {
+    groups: library.data.groups?.length,
+    roles: library.data.roles?.length,
+  })
+  check('分组与角色持久化到 state', (await call(routes, '/state')).data.roles.some((role) => role.id === 'sre'), null)
 
-  const finished = await waitForRun(routes, started.data.runId)
-  check('讨论正常结束', finished.status === 'done', { status: finished.status, error: finished.error })
-  check('2 轮 × 4 角色 = 8 条发言', finished.turns.length === 8, finished.turns.length)
-  check('发言落在正确轮次', finished.turns[7].round === 2, finished.turns[7])
-  check('每位角色每轮都带立场发言', finished.turns.every((turn) => !turn.error && turn.text.length > 0), finished.turns.map((t) => t.error))
-  check('拿到联网资料', finished.research?.sources?.length === 1, finished.research)
-  check('书记员产出 2 个候选方案', finished.proposals.length === 2, finished.proposals)
-  check('每位角色投出一票', finished.votes.length === 4 && finished.votes.every((vote) => vote.proposalId), finished.votes)
-  check('结论是多数票方案', finished.conclusion?.proposalId === 'B', finished.conclusion)
-  check('结论记录票数与少数意见', finished.conclusion?.counts?.B === 3 && finished.conclusion.dissent.length >= 1, finished.conclusion)
-
-  const history = await call(routes, '/history')
-  check('历史写入了这场讨论', history.data.history.length === 1 && history.data.history[0].id === started.data.runId, history.data.history)
-
-  const debate = await call(routes, `/debate?id=${started.data.runId}`)
-  check('可按 ID 重新读到完整讨论', debate.data.debate.turns.length === 8, debate.data.debate?.turns?.length)
-
-  // --- tie -> runoff -> conclusion ---
-  const tieRoot = await tempRoot('rtr-tie-')
-  const tie = createFakeContext({ root: tieRoot, reply: tieReply, web: false })
-  apply(tie.ctx, { root: tieRoot, researchMaxResults: 6, maxHistory: 40 })
-  const tieState = await call(tie.routes, '/state')
-  const tieStart = await call(tie.routes, '/start', {
+  // ---- issue: create / start / rounds / continue / vote ----
+  const created = await call(routes, '/issue/create', {
     method: 'POST',
-    body: { topic: '要不要现在裁员', rounds: 1, roleIds: tieState.data.roles.slice(0, 2).map((role) => role.id), research: true },
+    body: {
+      title: '是否在 Q1 内投入 300 万把移动端迁到 H5',
+      background: '原生双端维护成本高。',
+      goal: '决定是否投入与节奏',
+      roleIds: ['product', 'engineering', 'finance', 'user'],
+      plannedRounds: 2,
+      research: true,
+    },
   })
-  const tieRun = await waitForRun(tie.routes, tieStart.data.runId)
-  check('没有检索服务时降级为说明', tieRun.research?.available === false, tieRun.research)
-  check('1:1 平票进入复选', Array.isArray(tieRun.runoffVotes) && tieRun.runoffVotes.length === 2, tieRun.runoffVotes?.length)
-  check('复选仍平票时给出结论', Boolean(tieRun.conclusion) && tieRun.tally.tie === true, { tally: tieRun.tally, error: tieRun.error })
-  check('平票结论说明由谁裁定', String(tieRun.conclusion?.note ?? '').includes('书记员'), tieRun.conclusion?.note)
+  check('创建议题返回 draft 状态', created.status === 200 && created.data.issue.status === 'draft', created.data.issue?.status)
+  check(
+    '参与顺序按提交顺序冻结',
+    created.data.issue.participants.map((role) => role.roleId).join('>') === 'product>engineering>finance>user',
+    created.data.issue.participants.map((role) => role.roleId),
+  )
+  const issueId = created.data.issue.id
 
-  // --- validation and errors ---
-  const badStart = await call(routes, '/start', { method: 'POST', body: { topic: '短', rounds: 2 } })
-  check('过短议题被拒绝', badStart.status === 400 && badStart.data.error.includes('太短'), badStart.data)
+  const started = await call(routes, '/issue/start', { method: 'POST', body: { id: issueId } })
+  check('开始讨论后进入 running', started.status === 200, started.data.issue?.status)
+  let issue = await waitIdle(routes, issueId)
+  check('按计划跑满 2 轮 × 4 角色 = 8 条发言', issue.turns.length === 8, issue.turns.length)
+  check('跑完后状态是 discussing（等用户决定下一步）', issue.status === 'discussing', issue.status)
+  check('拿到联网资料', issue.research?.sources?.length === 1, issue.research?.sources?.length)
+  check('尚未表决时没有结论', issue.conclusion === null, issue.conclusion)
 
-  const badRoles = await call(routes, '/roles', { method: 'POST', body: { roles: [{ name: '', persona: 'x' }] } })
-  check('空名称被拒绝', badRoles.status === 400, badRoles.data)
+  const continued = await call(routes, '/issue/continue', { method: 'POST', body: { id: issueId, rounds: 1 } })
+  check('5 轮之后仍可继续追加（计划轮数 +1）', continued.status === 200 && continued.data.issue.plannedRounds === 3, continued.data.issue?.plannedRounds)
+  issue = await waitIdle(routes, issueId)
+  check('追加轮次产生了第 3 轮发言', issue.turns.length === 12 && issue.turns.at(-1).round === 3, { turns: issue.turns.length, lastRound: issue.turns.at(-1)?.round })
+  check('追加轮次用「追加讨论」任务', issue.turns.at(-1).text.startsWith('（追加）'), issue.turns.at(-1).text.slice(0, 20))
 
-  const badRounds = await call(routes, '/settings', { method: 'POST', body: { rounds: 9 } })
-  check('非法轮数被拒绝', badRounds.status === 400, badRounds.data)
+  const voted = await call(routes, '/issue/vote', { method: 'POST', body: { id: issueId } })
+  check('表决后进入投票流程', voted.status === 200, voted.data.issue?.status)
+  issue = await waitIdle(routes, issueId)
+  check('书记员产出 2 个候选方案', issue.proposals.length === 2, issue.proposals?.length)
+  check('每位角色投出一票', issue.votes.length === 4 && issue.votes.every((vote) => vote.proposalId), issue.votes?.length)
+  check('结论按多数票产生', issue.conclusion?.proposalId === 'B' && issue.conclusion.counts.B >= 2, issue.conclusion?.counts)
+  check('结论保留少数意见', issue.conclusion.dissent.length >= 1, issue.conclusion.dissent?.length)
+  check('表决后状态是 decided', issue.status === 'decided', issue.status)
 
-  const missing = await call(routes, '/run?id=nope')
-  check('未知 run 返回 404', missing.status === 404, missing.data)
+  const stale = await call(routes, '/issue/continue', { method: 'POST', body: { id: issueId, rounds: 1 } })
+  check('已有结论后继续讨论会把结论标记为过期', stale.status === 200, stale.status)
+  issue = await waitIdle(routes, issueId)
+  check('结论被标记 stale', issue.conclusion?.stale === true, issue.conclusion?.stale)
+  check('旧结论没有被删除，仍可回看', Boolean(issue.conclusion?.title), issue.conclusion?.title)
+
+  const cleared = await call(routes, '/issue/clear-conclusion', { method: 'POST', body: { id: issueId } })
+  check('可以清除结论重新表决', cleared.status === 200 && cleared.data.issue.conclusion === null, cleared.data.issue?.status)
+
+  // ---- AI assist ----
+  const assist1 = await call(routes, '/assist/issue', { method: 'POST', body: { input: '我想讨论要不要把移动端改成 H5' } })
+  check('议题助手第一轮会追问且 ready=false', assist1.status === 200 && assist1.data.ready === false && assist1.data.reply.length > 0, assist1.data.ready)
+  check('议题助手给出草稿', assist1.data.draft?.title.length > 0, assist1.data.draft)
+
+  const assist2 = await call(routes, '/assist/issue', {
+    method: 'POST',
+    body: {
+      input: '预算 300 万，Q1 内完成',
+      history: [
+        { role: 'user', content: '我想讨论要不要把移动端改成 H5' },
+        { role: 'assistant', content: assist1.data.reply },
+      ],
+    },
+  })
+  check('议题助手多轮后可定稿（ready=true）', assist2.status === 200 && assist2.data.ready === true, assist2.data.ready)
+  check('定稿带背景/目标/核对清单', Boolean(assist2.data.draft.background && assist2.data.draft.goal && assist2.data.draft.checklist.length), assist2.data.draft)
+  check('议题助手收到多轮上下文', assist2.data.reply.includes('信息够了'), assist2.data.reply)
+
+  const roleAssist = await call(routes, '/assist/role', { method: 'POST', body: { input: '我需要一个懂安全和上线的人', existingNames: ['产品经理'], groupName: '运维与安全' } })
+  check('角色助手给出 2~3 个候选', roleAssist.status === 200 && roleAssist.data.suggestions.length === 2, roleAssist.data.suggestions?.length)
+  check('候选含名称/关注点/立场', roleAssist.data.suggestions.every((item) => item.name && item.focus && item.persona.length >= 20), roleAssist.data.suggestions)
+
+  check('空描述会被拒绝', (await call(routes, '/assist/role', { method: 'POST', body: { input: '' } })).status === 400, null)
+
+  // ---- validation, list ordering, delete ----
+  const badIssue = await call(routes, '/issue/create', { method: 'POST', body: { title: '短', roleIds: ['product', 'engineering'] } })
+  check('过短标题被拒绝', badIssue.status === 400 && badIssue.data.error.includes('太短'), badIssue.data)
+
+  const fewRoles = await call(routes, '/issue/create', { method: 'POST', body: { title: '只有一个角色的议题', roleIds: ['product'] } })
+  check('少于 2 个角色被拒绝', fewRoles.status === 400 && fewRoles.data.error.includes('2 个角色'), fewRoles.data)
+
+  const second = await call(routes, '/issue/create', { method: 'POST', body: { title: '另一个议题：要不要上自动化测试', roleIds: ['engineering', 'product'], plannedRounds: 3 } })
+  const list = await call(routes, '/state')
+  check('议题列表按创建时间倒序', list.data.issues[0].id === second.data.issue.id, list.data.issues.map((item) => item.title))
+  check('列表项带摘要字段', list.data.issues.every((item) => typeof item.turnCount === 'number' && Array.isArray(item.participants)), list.data.issues[0])
+
+  const deleted = await call(routes, '/issue/delete', { method: 'POST', body: { id: second.data.issue.id } })
+  check('删除议题成功', deleted.status === 200 && deleted.data.deleted === true, deleted.data)
+  check('删除后列表只剩一条', (await call(routes, '/state')).data.issues.length === 1, null)
+
+  check('未知议题返回 404', (await call(routes, '/issue?id=nope')).status === 404, null)
+
+  const renamed = await call(routes, '/issue/update', { method: 'POST', body: { id: issueId, title: '改个标题' } })
+  check('可修改空闲议题的标题', renamed.status === 200 && renamed.data.issue.title === '改个标题', renamed.data.issue?.title)
 
   await rm(root, { recursive: true, force: true })
-  await rm(tieRoot, { recursive: true, force: true })
 
-  for (const item of checks) {
-    console.log(`${item.ok ? 'PASS' : 'FAIL'}  ${item.name}${item.ok ? '' : `  → ${JSON.stringify(item.detail)}`}`)
-  }
+  for (const item of checks) console.log(`${item.ok ? 'PASS' : 'FAIL'}  ${item.name}${item.ok ? '' : `  → ${JSON.stringify(item.detail)}`}`)
   console.log(`\n${checks.filter((item) => item.ok).length}/${checks.length} 项通过`)
   if (failures) process.exitCode = 1
 }

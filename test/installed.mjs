@@ -55,9 +55,11 @@ const expected = [
   'assist/role',
   'assist/team',
   'assist/revise',
+  'models',
+  'models/save',
   'library/apply',
 ]
-check('注册了全部 16 条路由', expected.length === 16 && expected.every((name) => routes.has(`/api/issue-roundtable/${name}`)), [...routes.keys()].sort())
+check('注册了全部 18 条路由', expected.length === 18 && expected.every((name) => routes.has(`/api/issue-roundtable/${name}`)), [...routes.keys()].sort())
 
 const state = routes.get('/api/issue-roundtable/state')
 const response = await state.fetch(new Request('http://127.0.0.1/api/issue-roundtable/state'))
@@ -66,7 +68,7 @@ check('state 返回内置分组与角色', response.status === 200 && data.group
   groups: data.groups?.length,
   roles: data.roles?.length,
 })
-check('没有配置模型时 model 为 null', data.model === null, data.model)
+check('没有配置模型时解析结果为空', data.model?.host === null && data.model?.resolved?.discuss === null, data.model)
 
 const startRoute = routes.get('/api/issue-roundtable/issue/start')
 const failing = await startRoute.fetch(
@@ -109,4 +111,6 @@ dispose?.()
 await rm(root, { recursive: true, force: true })
 console.log(`\n${failures ? 'FAILED' : '全部通过'}`)
 if (failures) process.exitCode = 1
+
+
 

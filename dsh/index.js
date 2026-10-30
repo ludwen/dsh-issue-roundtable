@@ -149,12 +149,18 @@ export function normalizeRoles(input, groups) {
     if (persona.length < 20) throw new HttpError(`角色「${name}」的立场描述太短，请至少写 20 个字。`)
     const id = uniqueId(taken, raw?.id, `role-${index + 1}`)
     taken.add(id)
+    // An explicit per-role model beats the purpose-level selection.
+    const model =
+      raw?.model && typeof raw.model.provider === 'string' && typeof raw.model.model === 'string' && raw.model.provider.trim() && raw.model.model.trim()
+        ? { provider: raw.model.provider.trim(), model: raw.model.model.trim() }
+        : null
     roles.push({
       id,
       name,
       focus: clampText(typeof raw?.focus === 'string' ? raw.focus.trim() : '', 60).trim(),
       persona,
       groupId: groupIds.has(raw?.groupId) ? raw.groupId : groups[0].id,
+      ...(model ? { model } : {}),
     })
   }
   return roles
@@ -245,31 +251,88 @@ function createStore(root) {
       const groups = await readJson('groups.json', null)
       const roles = await readJson('roles.json', null)
       const issues = await readJson('issues.json', null)
+      const settings = await readJson('settings.json', null)
       return {
         groups,
         roles,
+        settings,
         issues: Array.isArray(issues) ? issues.filter((item) => item && typeof item.id === 'string').slice(0, maxIssues) : [],
       }
     },
     saveGroups: (groups) => writeJson('groups.json', groups),
     saveRoles: (roles) => writeJson('roles.json', roles),
+    saveSettings: (settings) => writeJson('settings.json', settings),
     saveIssues: (issues) => writeJson('issues.json', issues),
   }
 }
 
 // ------------------------------------------------------------- model calls
 
-function resolveSelection(ctx, fallback) {
-  if (fallback?.provider && fallback?.model) return fallback
+function hostDefaultSelection(ctx) {
   const selection = ctx.get('agentDefaultModel')?.currentSelection?.()
   if (selection?.provider && selection?.model) return { provider: selection.provider, model: selection.model }
-  throw new HttpError('还没有可用的模型：请先在设置里选择一个默认模型。', 409)
+  return null
+}
+
+/**
+ * Resolve the model for one purpose.
+ *
+ * Precedence, highest first:
+ *   1. that purpose's explicit selection (discuss / issue-assist / role-assist)
+ *   2. the per-role override, when this call speaks as a role
+ *   3. the host default model from the Agent settings
+ */
+function resolveSelection(ctx, settings, purpose, roleModel) {
+  if (roleModel?.provider && roleModel?.model) return roleModel
+  const chosen = settings?.[purpose]
+  if (chosen?.provider && chosen?.model) return chosen
+  const host = hostDefaultSelection(ctx)
+  if (host) return host
+  throw new HttpError('还没有可用的模型：请先在设置里选择一个默认模型，或在本工作台的「模型」里指定。', 409)
+}
+
+const MODEL_PURPOSES = ['discuss', 'issueAssist', 'roleAssist']
+
+/** Normalize the persisted per-purpose selection: null means "use host default". */
+export function normalizeModelSettings(input) {
+  const settings = {}
+  for (const purpose of MODEL_PURPOSES) {
+    const raw = input?.[purpose]
+    settings[purpose] =
+      raw && typeof raw.provider === 'string' && typeof raw.model === 'string' && raw.provider.trim() && raw.model.trim()
+        ? { provider: raw.provider.trim(), model: raw.model.trim() }
+        : null
+  }
+  return settings
+}
+
+/** Enumerate the routes and models a user can pick, best effort. */
+async function listAvailableModels(ctx) {
+  const llm = ctx.get('llm')
+  if (llm === undefined) return []
+  let providers = []
+  try {
+    providers = llm.listProviders?.() ?? []
+  } catch {
+    providers = []
+  }
+  const rows = []
+  for (const provider of providers) {
+    try {
+      const models = await llm.listModels(provider.id)
+      for (const model of models ?? []) rows.push({ provider: provider.id, providerName: provider.name ?? provider.id, model: model.id, name: model.name ?? model.id })
+    } catch {
+      rows.push({ provider: provider.id, providerName: provider.name ?? provider.id, model: '', name: '（该提供方没有公开模型列表）' })
+    }
+  }
+  return rows
 }
 
 async function callModel(ctx, options) {
   const llm = ctx.get('llm')
   if (llm === undefined) throw new HttpError('模型服务不可用（llm 服务未加载）。', 503)
-  const target = resolveSelection(ctx, options.fallback)
+  const target = options.target ?? hostDefaultSelection(ctx)
+  if (!target) throw new HttpError('还没有可用的模型：请先在设置里选择一个默认模型，或在本工作台的「模型」里指定。', 409)
   const request = {
     provider: target.provider,
     model: target.model,
@@ -295,7 +358,7 @@ async function callModel(ctx, options) {
       }
     }
   }
-  return { text: text.trim(), usage }
+  return { text: text.trim(), usage, provider: target.provider, model: target.model }
 }
 
 async function research(ctx, query, maxResults, signal) {
@@ -463,7 +526,7 @@ export function apply(ctx, config) {
           roles = defaultRoles()
         }
         if (!roles.length) roles = defaultRoles()
-        state = { groups, roles, issues: stored.issues }
+        state = { groups, roles, settings: { models: normalizeModelSettings(stored.settings?.models) }, issues: stored.issues }
         return state
       })
     }
@@ -471,6 +534,7 @@ export function apply(ctx, config) {
   }
 
   const saveIssues = () => store.saveIssues(state.issues)
+  const saveSettings = () => store.saveSettings(state.settings)
   const findIssue = (id) => state.issues.find((issue) => issue.id === id)
 
   function issueSummary(issue) {
@@ -527,7 +591,8 @@ export function apply(ctx, config) {
           let turn
           try {
             const result = await callModel(ctx, {
-              fallback: issue.model,
+              // A role may name its own model; that beats the discuss purpose.
+              target: resolveSelection(ctx, state.settings?.models, 'discuss', role.model),
               system: roleSystem(role),
               user: [
                 `【议题】${issue.title}`,
@@ -550,6 +615,7 @@ export function apply(ctx, config) {
               focus: role.focus,
               text: result.text || '（这次没有产生可读的发言。）',
               at: now(),
+              model: { provider: result.provider, model: result.model },
             }
             issue.usage.push(result.usage)
           } catch (error) {
@@ -607,7 +673,7 @@ export function apply(ctx, config) {
     for (let attempt = 0; attempt < 2 && parsed === null; attempt += 1) {
       try {
         const result = await callModel(ctx, {
-          fallback: issue.model,
+          target: resolveSelection(ctx, state.settings?.models, 'discuss'),
           system: '你是圆桌讨论的书记员，负责把讨论收敛成可表决的候选方案。你只输出一个 JSON 对象。',
           user: prompt,
           maxTokens: 1200,
@@ -656,7 +722,7 @@ export function apply(ctx, config) {
         const last = [...issue.turns].reverse().find((turn) => turn.roleId === role.roleId && !turn.error && turn.text)
         try {
           const result = await callModel(ctx, {
-            fallback: issue.model,
+            target: resolveSelection(ctx, state.settings?.models, 'discuss'),
             system: voteSystem(role),
             user: [
               `【议题】${issue.title}`,
@@ -784,22 +850,45 @@ export function apply(ctx, config) {
     return issue
   }
 
+  const modelSummary = async () => {
+    const host = hostDefaultSelection(ctx)
+    const models = state.settings?.models
+    const resolved = {}
+    for (const purpose of MODEL_PURPOSES) {
+      try {
+        resolved[purpose] = resolveSelection(ctx, models, purpose)
+      } catch {
+        resolved[purpose] = null
+      }
+    }
+    return { host, selections: models, resolved, purposes: MODEL_PURPOSES }
+  }
+
   route('/state', ['GET'], async () => {
     await loadState()
-    let model = null
-    try {
-      model = resolveSelection(ctx)
-    } catch {
-      model = null
-    }
+    const model = await modelSummary()
     return respond({
       groups: state.groups,
       roles: state.roles,
       issues: state.issues.map(issueSummary),
       model,
+      models: model,
       runningIssueId: [...controllers.keys()][0] ?? null,
       limits: { maxRoles: MAX_ROLES, maxRounds: MAX_ROUNDS, maxParticipants: MAX_PARTICIPANTS },
     })
+  })
+
+  route('/models', ['GET'], async () => {
+    await loadState()
+    return respond({ available: await listAvailableModels(ctx), ...(await modelSummary()) })
+  })
+
+  route('/models/save', ['POST'], async (request) => {
+    await loadState()
+    const body = await readBody(request)
+    state.settings = { ...state.settings, models: normalizeModelSettings(body?.models) }
+    await saveSettings()
+    return respond({ models: state.settings.models, ...(await modelSummary()) })
   })
 
   route('/library', ['POST'], async (request) => {
@@ -829,7 +918,7 @@ export function apply(ctx, config) {
       .map((id) => state.roles.find((role) => role.id === id))
       .filter(Boolean)
       .slice(0, MAX_PARTICIPANTS)
-      .map((role) => ({ roleId: role.id, name: role.name, focus: role.focus, persona: role.persona, groupId: role.groupId }))
+      .map((role) => ({ roleId: role.id, name: role.name, focus: role.focus, persona: role.persona, groupId: role.groupId, model: role.model }))
     if (participants.length < 2) throw new HttpError('至少选择 2 个角色参与讨论。')
     const plannedRounds = Number(body?.plannedRounds ?? 3)
     if (!Number.isInteger(plannedRounds) || plannedRounds < 1 || plannedRounds > MAX_ROUNDS) {
@@ -837,7 +926,7 @@ export function apply(ctx, config) {
     }
     let model
     try {
-      model = resolveSelection(ctx)
+      model = resolveSelection(ctx, state.settings?.models, 'discuss')
     } catch (error) {
       throw new HttpError(error instanceof Error ? error.message : String(error), 409)
     }
@@ -984,7 +1073,7 @@ export function apply(ctx, config) {
       })
     }
     messages.push({ role: 'user', content: [{ type: 'text', text: input }] })
-    const result = await callModel(ctx, { system: ISSUE_ASSIST_SYSTEM, messages, maxTokens: 900, temperature: 0.4 })
+    const result = await callModel(ctx, { system: ISSUE_ASSIST_SYSTEM, messages, maxTokens: 900, temperature: 0.4, target: resolveSelection(ctx, state.settings?.models, 'issueAssist') })
     const parsed = extractJson(result.text)
     const draft =
       parsed?.draft && typeof parsed.draft === 'object'
@@ -1011,6 +1100,7 @@ export function apply(ctx, config) {
     const existing = Array.isArray(body?.existingNames) ? body.existingNames.slice(0, 20).join('、') : ''
     const result = await callModel(ctx, {
       system: ROLE_ASSIST_SYSTEM,
+      target: resolveSelection(ctx, state.settings?.models, 'roleAssist'),
       user: [`【用户想要的角色】\n${input}`, existing ? `【已有角色（避免重复）】\n${existing}` : '', body?.groupName ? `【所属分组】${body.groupName}` : '']
         .filter(Boolean)
         .join('\n\n'),
@@ -1044,6 +1134,7 @@ export function apply(ctx, config) {
     const existingRoles = state.roles.map((role) => role.name).join('、')
     const result = await callModel(ctx, {
       system: TEAM_ASSIST_SYSTEM,
+      target: resolveSelection(ctx, state.settings?.models, 'roleAssist'),
       user: [
         `【用户想要的团队】\n${input}`,
         existingGroups ? `【已有分组（避免重名）】\n${existingGroups}` : '',
@@ -1098,6 +1189,7 @@ export function apply(ctx, config) {
       : '指定角色'
     const result = await callModel(ctx, {
       system: TEAM_REVISE_SYSTEM,
+      target: resolveSelection(ctx, state.settings?.models, 'roleAssist'),
       user: [
         `【修改范围】${scopeLabel}，共 ${targets.length} 个角色`,
         targets.map((role) => `--- id: ${role.id}\n名称：${role.name}\n关注点：${role.focus || '（无）'}\n现有人设：${role.persona}`).join('\n'),
@@ -1270,6 +1362,7 @@ export function apply(ctx, config) {
             const current = await describeLibrary()
             const result = await callModel(ctx, {
               system: TEAM_ASSIST_SYSTEM,
+      target: resolveSelection(ctx, state.settings?.models, 'roleAssist'),
               user: [
                 `【用户想要的团队】\n${scenario}`,
                 current.groups.length ? `【已有分组（避免重名）】\n${current.groups.map((group) => group.name).join('、')}` : '',
@@ -1325,3 +1418,10 @@ function issueView(issue) {
 
 /** Exported for tests; the panel never imports the host half. */
 export const internals = { extractJson, normalizeProposals, normalizeGroups, normalizeRoles, defaultGroups, defaultRoles }
+
+
+
+
+
+
+

@@ -731,7 +731,7 @@ window.__ModuleLoader__.load({
     }
 
     /* ---- library ---- */
-    function RoleForm({ role, groups, onSave, onCancel, busy }) {
+    function RoleForm({ role, groups, models, onSave, onCancel, busy }) {
       const [draft, setDraft] = React.useState(role)
       const [wish, setWish] = React.useState('')
       const [suggestions, setSuggestions] = React.useState([])
@@ -777,10 +777,69 @@ window.__ModuleLoader__.load({
               groups.map((group) => h('option', { key: group.id, value: group.id }, group.name))))),
         h('label', { className: 'rtr-field' }, h('span', null, '立场与说话方式（至少 20 字）'),
           h('textarea', { className: 'rtr-textarea', rows: 5, maxLength: 1400, value: draft.persona, onChange: (event) => setDraft({ ...draft, persona: event.target.value }) })),
+        h('label', { className: 'rtr-field' }, h('span', null, '这个角色单独使用的模型（可选，留空跟随「讨论」用途）'),
+          h('select', {
+            className: 'rtr-input',
+            value: draft.model ? `${draft.model.provider}::${draft.model.model}` : '',
+            onChange: (event) => {
+              const value = event.target.value
+              setDraft({ ...draft, model: value ? { provider: value.split('::')[0], model: value.split('::').slice(1).join('::') } : undefined })
+            },
+          },
+            h('option', { value: '' }, '跟随讨论模型'),
+            (models ?? []).map((row) => h('option', { key: `${row.provider}::${row.model}`, value: `${row.provider}::${row.model}` }, `${row.providerName} · ${row.name || row.model}`)))),
         h('div', { className: 'rtr-row' },
           h('span', { className: 'rtr-spacer', style: { flex: 1 } }),
           h('button', { className: 'rtr-btn', onClick: onCancel, disabled: busy }, '取消'),
           h('button', { className: 'rtr-btn rtr-btn-primary', onClick: () => onSave(draft), disabled: busy || !draft.name.trim() || draft.persona.trim().length < 20 }, '保存角色')),
+      )
+    }
+
+    /* ---- model settings: per purpose, plus the per-role override above ---- */
+
+    const PURPOSE_LABELS = {
+      discuss: '讨论与表决（角色发言、书记员、投票）',
+      issueAssist: '议题助手（起草与核对议题）',
+      roleAssist: '角色助手（写角色、建团队、批量改写）',
+    }
+
+    function ModelSettings({ available, models, onSave, busy }) {
+      const [draft, setDraft] = React.useState({
+        discuss: models?.selections?.discuss ? `${models.selections.discuss.provider}::${models.selections.discuss.model}` : '',
+        issueAssist: models?.selections?.issueAssist ? `${models.selections.issueAssist.provider}::${models.selections.issueAssist.model}` : '',
+        roleAssist: models?.selections?.roleAssist ? `${models.selections.roleAssist.provider}::${models.selections.roleAssist.model}` : '',
+      })
+      const [notice, setNotice] = React.useState('')
+      const rows = available ?? []
+      const hostLabel = models?.host ? `${models.host.provider} / ${models.host.model}` : '未设置'
+      const decode = (value) => (value ? { provider: value.split('::')[0], model: value.split('::').slice(1).join('::') } : null)
+      const submit = async () => {
+        setNotice('')
+        try {
+          await onSave({ discuss: decode(draft.discuss), issueAssist: decode(draft.issueAssist), roleAssist: decode(draft.roleAssist) })
+          setNotice('已保存')
+        } catch (failure) {
+          setNotice(failure instanceof Error ? failure.message : String(failure))
+        }
+      }
+      return h(
+        'div',
+        { className: 'rtr-view' },
+        h('div', { className: 'rtr-list-head' },
+          h('div', null, h('h2', null, '模型'), h('p', { className: 'rtr-hint' }, `宿主默认：${hostLabel} · 没选的用途会自动跟随它`))),
+        h('div', { className: 'rtr-form' },
+          Object.entries(PURPOSE_LABELS).map(([purpose, label]) =>
+            h('label', { key: purpose, className: 'rtr-field' },
+              h('span', null, label),
+              h('select', { className: 'rtr-input', value: draft[purpose], onChange: (event) => setDraft({ ...draft, [purpose]: event.target.value }) },
+                h('option', { value: '' }, `跟随宿主默认（${hostLabel}）`),
+                rows.map((row) => h('option', { key: `${row.provider}::${row.model}`, value: `${row.provider}::${row.model}` }, `${row.providerName} · ${row.name || row.model}`))))),
+          h('div', { className: 'rtr-hint' }, `当前解析：讨论 ${models?.resolved?.discuss?.model ?? '—'} · 议题 ${models?.resolved?.issueAssist?.model ?? '—'} · 角色 ${models?.resolved?.roleAssist?.model ?? '—'}`),
+          h('div', { className: 'rtr-row' },
+            h('span', { className: 'rtr-spacer', style: { flex: 1 } }),
+            h('button', { className: 'rtr-btn rtr-btn-primary', onClick: submit, disabled: busy }, busy ? '保存中…' : '保存模型设置')),
+          notice ? h('div', { className: 'rtr-hint' }, notice) : null,
+          h('p', { className: 'rtr-hint' }, '单个角色可以在「角色库 → 编辑」里单独绑定模型，它的优先级高于这里的「讨论」用途。')),
       )
     }
 
@@ -904,7 +963,7 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function Library({ state, onSave, onTeamApply, busy, error }) {
+    function Library({ state, availableModels, onSave, onTeamApply, busy, error }) {
       const groups = state.groups
       const [activeGroup, setActiveGroup] = React.useState('all')
       const [roleForm, setRoleForm] = React.useState(null)
@@ -1097,7 +1156,7 @@ window.__ModuleLoader__.load({
         head,
         panel === 'team' ? h(TeamWizard, { state, onCancel: () => setPanel(null), onApply: onTeamApply, busy }) : null,
         groupForm ? h(GroupForm, { group: groupForm, onSave: saveGroup, onCancel: () => setGroupForm(null) }) : null,
-        roleForm ? h(RoleForm, { role: roleForm, groups, onSave: saveRole, onCancel: () => setRoleForm(null), busy }) : null,
+        roleForm ? h(RoleForm, { role: roleForm, groups, models: availableModels, onSave: saveRole, onCancel: () => setRoleForm(null), busy }) : null,
         selectionBar,
         rewritePreview,
         h('div', { className: 'rtr-lib-body' }, groupColumn, roleColumn),
@@ -1116,6 +1175,7 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState('')
       const [loadError, setLoadError] = React.useState('')
       const [wizardKey, setWizardKey] = React.useState(0)
+      const [modelInfo, setModelInfo] = React.useState({ available: [], loading: true })
       installStyle()
 
       const loadState = React.useCallback(async () => {
@@ -1130,9 +1190,19 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
+      const loadModels = React.useCallback(async () => {
+        try {
+          const data = await api('/models')
+          setModelInfo({ available: data.available ?? [], models: data, loading: false })
+        } catch {
+          setModelInfo({ available: [], loading: false })
+        }
+      }, [])
+
       React.useEffect(() => {
         void loadState()
-      }, [loadState])
+        void loadModels()
+      }, [loadState, loadModels])
 
       const loadIssue = React.useCallback(async (id) => {
         try {
@@ -1227,7 +1297,8 @@ window.__ModuleLoader__.load({
         h('span', { className: 'rtr-spacer' }),
         h('nav', { className: 'rtr-nav' },
           h('button', { 'data-on': view !== 'library' ? '' : undefined, onClick: () => setView(issueId ? 'issue' : 'issues') }, '议题'),
-          h('button', { 'data-on': view === 'library' ? '' : undefined, onClick: () => setView('library') }, '角色库')),
+          h('button', { 'data-on': view === 'library' ? '' : undefined, onClick: () => setView('library') }, '角色库'),
+          h('button', { 'data-on': view === 'models' ? '' : undefined, onClick: () => { setView('models'); void loadModels() } }, '模型')),
         h('button', { className: 'rtr-btn rtr-btn-ghost', onClick: () => { void loadState(); if (view === 'issue' && issueId) void loadIssue(issueId) } }, '刷新'),
       )
 
@@ -1239,7 +1310,19 @@ window.__ModuleLoader__.load({
       } else if (!state) {
         content = h('div', { className: 'rtr-empty' }, '正在加载…')
       } else if (view === 'library') {
-        content = h(Library, { state, onSave: saveLibrary, onTeamApply: saveLibrary, busy, error })
+        content = h(Library, { state, availableModels: modelInfo.available, onSave: saveLibrary, onTeamApply: saveLibrary, busy, error })
+      } else if (view === 'models') {
+        content = h(ModelSettings, {
+          available: modelInfo.available,
+          models: modelInfo.models,
+          busy,
+          onSave: async (models) => {
+            const data = await post('/models/save', { models })
+            setModelInfo({ available: data.available ?? modelInfo.available, models: data })
+            await loadState()
+            await loadModels()
+          },
+        })
       } else if (view === 'wizard') {
         content = h(IssueWizard, {
           key: wizardKey,
@@ -1297,5 +1380,7 @@ window.__ModuleLoader__.load({
     return { apply, inject: ['desktopWorkbenches'] }
   },
 })
+
+
 
 

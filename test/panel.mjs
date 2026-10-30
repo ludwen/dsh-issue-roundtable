@@ -107,12 +107,28 @@ const state = {
   limits: { maxRoles: 12, maxRounds: 8, maxParticipants: 8 },
 }
 
+const modelPayload = {
+  host: { provider: 'trae', model: 'deepseek-v4.1-flash' },
+  selections: { discuss: null, issueAssist: null, roleAssist: null },
+  resolved: { discuss: { provider: 'trae', model: 'deepseek-v4.1-flash' }, issueAssist: { provider: 'trae', model: 'deepseek-v4.1-flash' }, roleAssist: { provider: 'trae', model: 'deepseek-v4.1-flash' } },
+  purposes: ['discuss', 'issueAssist', 'roleAssist'],
+  available: [
+    { provider: 'trae', providerName: 'Trae', model: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' },
+    { provider: 'trae', providerName: 'Trae', model: 'kimi-k3', name: 'Kimi K3' },
+  ],
+}
+
 const calls = []
 globalThis.fetch = async (url, init = {}) => {
   const path = String(url).replace('/api/issue-roundtable', '')
   calls.push({ path, method: init.method ?? 'GET' })
   let payload = {}
-  if (path.startsWith('/state')) payload = state
+  if (path.startsWith('/models/save')) {
+    const body = JSON.parse(init.body)
+    payload = { ...modelPayload, selections: body.models, resolved: { discuss: body.models.discuss ?? modelPayload.host, issueAssist: body.models.issueAssist ?? modelPayload.host, roleAssist: body.models.roleAssist ?? modelPayload.host } }
+    modelPayload.selections = body.models
+  } else if (path.startsWith('/models')) payload = modelPayload
+  else if (path.startsWith('/state')) payload = state
   else if (path.startsWith('/issue?id=')) payload = { issue: issueState, summary: {} }
   else if (path.startsWith('/assist/issue')) {
     const body = JSON.parse(init.body)
@@ -398,6 +414,39 @@ check('改写只落到勾选的角色', state.roles.some((role) => role.persona.
 check('未勾选的角色保持原人设', state.roles.some((role) => role.persona.includes('你从用户价值出发')), null)
 check('应用后预览关闭', !host.querySelector('.rtr-diff'), null)
 
+// ---- model settings: per purpose + per role override ----
+click(findByText('.rtr-nav button', '模型'))
+await wait(200)
+check('模型页列出三个用途', host.querySelectorAll('.rtr-form .rtr-field select').length === 3, host.querySelectorAll('.rtr-form .rtr-field select').length)
+check('显示宿主默认模型', host.textContent.includes('deepseek-v4.1-flash'), null)
+const purposeSelects = [...host.querySelectorAll('.rtr-form .rtr-field select')]
+const optionCount = purposeSelects[0].querySelectorAll('option').length
+check('用途下拉含宿主默认与可用模型', optionCount === 3, optionCount)
+
+const discussSelect = purposeSelects[0]
+const selectSetter = Object.getOwnPropertyDescriptor(dom.window.HTMLSelectElement.prototype, 'value').set
+selectSetter.call(discussSelect, 'trae::kimi-k3')
+discussSelect.dispatchEvent(new dom.window.Event('change', { bubbles: true }))
+await wait(80)
+click(findByText('.rtr-form .rtr-btn-primary', '保存模型设置'))
+await wait(250)
+check('保存调用 /models/save', calls.some((call) => call.path === '/models/save' && call.method === 'POST'), null)
+check('保存后讨论用途指向 kimi-k3', modelPayload.selections.discuss?.model === 'kimi-k3', modelPayload.selections)
+
+// per-role override in the role editor
+click(findByText('.rtr-nav button', '角色库'))
+await wait(200)
+click([...host.querySelectorAll('.rtr-lib-role')].find((node) => node.textContent.includes('产品经理')).querySelector('.rtr-btn-ghost'))
+await wait(150)
+const roleModelSelect = [...host.querySelectorAll('.rtr-lib-form select')].at(-1)
+check('角色编辑里有单独模型下拉', roleModelSelect?.querySelectorAll('option').length === 3, roleModelSelect?.querySelectorAll('option').length)
+selectSetter.call(roleModelSelect, 'trae::kimi-k3')
+roleModelSelect.dispatchEvent(new dom.window.Event('change', { bubbles: true }))
+await wait(80)
+click(findByText('.rtr-lib-form .rtr-btn-primary', '保存角色'))
+await wait(250)
+check('角色级模型被保存', state.roles.find((role) => role.name === '产品经理')?.model?.model === 'kimi-k3', state.roles.find((r) => r.name === '产品经理')?.model)
+
 // ---- layout guards ----
 check('根容器无横向溢出', host.scrollWidth <= host.clientWidth + 1, { scrollWidth: host.scrollWidth, clientWidth: host.clientWidth })
 
@@ -429,6 +478,8 @@ const failed = results.filter((item) => !item.ok).length
 console.log(`\n${results.length - failed}/${results.length} 项通过`)
 root.unmount()
 if (failed) process.exitCode = 1
+
+
 
 
 

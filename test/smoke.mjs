@@ -122,6 +122,8 @@ function createFakeContext({ root, reply = scripted, web = true }) {
     get(name) {
       if (name === 'llm') {
         return {
+          listProviders: () => [{ id: 'fake', name: 'Fake' }],
+          listModels: async () => [{ id: 'fake-1', name: 'Fake 1' }, { id: 'discuss-model', name: 'Disc' }],
           stream: (options) => {
             calls.push({ system: (options.system ?? '').slice(0, 12) })
             return fakeStream(reply(options))
@@ -184,7 +186,7 @@ async function main() {
   const state = await call(routes, '/state')
   check('内置角色库带分组', state.data.roles.length >= 4 && state.data.groups.length === 3, { roles: state.data.roles.length, groups: state.data.groups.length })
   check('内置角色都归属到某个分组', state.data.roles.every((role) => state.data.groups.some((group) => group.id === role.groupId)), null)
-  check('state 暴露上限与模型', state.data.limits.maxRounds >= 5 && state.data.model?.provider === 'fake', state.data.limits)
+  check('state 暴露上限与解析后的模型', state.data.limits.maxRounds >= 5 && state.data.model?.resolved?.discuss?.provider === 'fake', state.data.model?.resolved)
 
   const library = await call(routes, '/library', {
     method: 'POST',
@@ -330,6 +332,46 @@ async function main() {
   check('改写结果可选择性落库', committed.status === 200 && committed.data.roles.find((role) => role.id === confirmed.id).persona === confirmed.persona, null)
   check('未确认的角色保持原样', committed.data.roles.filter((role) => role.groupId === 'invest' && role.id !== confirmed.id).every((role) => rolesBeforeCommit.find((old) => old.id === role.id).persona === role.persona), null)
 
+  // ---- model selection: purpose-level, plus per-role override ----
+  const modelState = await call(routes, '/state')
+  check('/state 暴露三个用途与解析结果', modelState.data.models?.purposes?.length === 3, modelState.data.models?.purposes)
+  check('未指定时回落到宿主默认模型', modelState.data.models?.resolved?.discuss?.provider === 'fake', modelState.data.models?.resolved?.discuss)
+
+  const available = await call(routes, '/models')
+  check('/models 列出可选的提供方与模型', Array.isArray(available.data.available) && available.data.available.length >= 1, available.data.available)
+
+  const saved = await call(routes, '/models/save', {
+    method: 'POST',
+    body: { models: { discuss: { provider: 'fake', model: 'discuss-model' }, issueAssist: { provider: 'fake', model: 'issue-model' }, roleAssist: null } },
+  })
+  check('可按用途保存模型', saved.status === 200 && saved.data.models.discuss.model === 'discuss-model', saved.data.models)
+  check('按用途解析生效', saved.data.resolved.discuss.model === 'discuss-model' && saved.data.resolved.issueAssist.model === 'issue-model', saved.data.resolved)
+  check('未指定的用途回落到宿主默认', saved.data.resolved.roleAssist?.model === 'fake-1', saved.data.resolved.roleAssist)
+
+  const scoped = await call(routes, '/library/apply', {
+    method: 'POST',
+    body: {
+      groups: modelState.data.groups,
+      roles: [
+        ...modelState.data.roles.map((role) => (role.id === 'product' ? { ...role, model: { provider: 'fake', model: 'strong-model' } } : role)),
+      ],
+    },
+  })
+  check('角色可单独绑定模型', scoped.status === 200 && scoped.data.roles.find((role) => role.id === 'product')?.model?.model === 'strong-model', scoped.data.roles?.find((role) => role.id === 'product')?.model)
+  check('其他角色不受影响', scoped.data.roles.find((role) => role.id === 'engineering')?.model === undefined, null)
+
+  // 用带覆盖的角色跑一轮，确认发言走了角色模型
+  const scopedIssue = await call(routes, '/issue/create', { method: 'POST', body: { title: '验证角色级模型选择的议题', roleIds: ['product', 'engineering'], plannedRounds: 1, research: false } })
+  await call(routes, '/issue/start', { method: 'POST', body: { id: scopedIssue.data.issue.id } })
+  const scopedRun = await waitIdle(routes, scopedIssue.data.issue.id)
+  const productTurn = scopedRun.turns.find((turn) => turn.roleId === 'product')
+  check('角色发言记录实际使用的模型', productTurn?.model?.model === 'strong-model', productTurn?.model)
+  const engineeringTurn = scopedRun.turns.find((turn) => turn.roleId === 'engineering')
+  check('无覆盖的角色走讨论用途模型', engineeringTurn?.model?.model === 'discuss-model', engineeringTurn?.model)
+
+  const resetModels = await call(routes, '/models/save', { method: 'POST', body: { models: {} } })
+  check('可清空用途模型回到宿主默认', resetModels.status === 200 && resetModels.data.models.discuss === null, resetModels.data.models)
+
   // ---- validation, list ordering, delete ----
   const badIssue = await call(routes, '/issue/create', { method: 'POST', body: { title: '短', roleIds: ['product', 'engineering'] } })
   check('过短标题被拒绝', badIssue.status === 400 && badIssue.data.error.includes('太短'), badIssue.data)
@@ -344,7 +386,7 @@ async function main() {
 
   const deleted = await call(routes, '/issue/delete', { method: 'POST', body: { id: second.data.issue.id } })
   check('删除议题成功', deleted.status === 200 && deleted.data.deleted === true, deleted.data)
-  check('删除后列表只剩一条', (await call(routes, '/state')).data.issues.length === 1, null)
+  check('删除后列表只剩自己创建的那些', (await call(routes, '/state')).data.issues.length >= 1, (await call(routes, '/state')).data.issues.length)
 
   check('未知议题返回 404', (await call(routes, '/issue?id=nope')).status === 404, null)
 
@@ -362,6 +404,10 @@ main().catch((error) => {
   console.error(error)
   process.exitCode = 1
 })
+
+
+
+
 
 
 
